@@ -232,3 +232,580 @@ decode_follow_flows <- function(steps = NULL, step_size = NULL, minimum_area = N
     minimum_area = int1(minimum_area)
   ))
 }
+
+
+# --------------------------------------------------------------------------- drawing
+#
+# A classes figure and an instances figure are different problems, and the difference is
+# what makes these possible without a ninth colour. `class_colours` stops at eight because
+# a figure with more than eight **classes** cannot be read by colour however it is painted.
+# But nobody reads object 214 by its colour either: what a person needs from an instance
+# map is *where one object ends and the next begins*, which is **adjacency, not identity**.
+# So a colour may repeat freely as long as it never repeats between neighbours, and eight
+# is then a surplus rather than a ceiling.
+#
+# Measured in the engine over all 670 Data Science Bowl cases, 524 of which hold touching
+# objects and 5436 adjacent pairs between them: an exact colouring needs **at most 3**
+# colours - 146 cases need one, 412 need two, 112 need three - against a maximum of 6
+# neighbours for any object and a mean of 0.37. The cheap alternative, colouring by object
+# value modulo eight, paints **550 of 5436 adjacent pairs in one colour, 10.12%**: one
+# touching pair in ten drawn as one object, in a figure whose whole subject is whether two
+# objects are two.
+#
+# These are pure R, like every other drawing here, for the reason `R/style.R` states: a
+# default that called the engine would make a five-gigabyte torch download the price of
+# drawing a mask somebody already has. What stops the two packages colouring the same
+# picture differently is therefore not shared code and not a shared constant - the palette
+# already agrees and would agree while the rule diverged - but
+# `tests/testthat/test-instance-drawing.R`, which draws the same pictures both ways and
+# compares them pixel for pixel. `maju116/rplatypus#154` is about that gap and not about
+# the code.
+
+#' Which objects touch, as pairs of label values
+#'
+#' Eight-connected on purpose, and the opposite of the choice a label-maker makes: labelling
+#' under 4-connectivity keeps a diagonal join from merging two objects, which errs towards
+#' finding more objects - the kind direction for a yardstick. Here the risk runs the other
+#' way. Two objects meeting only at a corner are *visually* adjacent, and giving them one
+#' colour would draw them as one.
+#'
+#' The four shifts are the engine's four, in its order, because this has to be the same rule
+#' rather than the same intention.
+#' @keywords internal
+#' @noRd
+instance_adjacent_pairs <- function(labels) {
+  height <- dim(labels)[1]
+  width <- dim(labels)[2]
+  pairs <- list()
+  shifts <- list(c(0L, 1L), c(1L, 0L), c(1L, 1L), c(1L, -1L))
+  for (shift in shifts) {
+    rows <- shift[[1]]
+    columns <- shift[[2]]
+    first_rows <- seq(1L + max(rows, 0L), height - max(-rows, 0L))
+    first_columns <- seq(1L + max(columns, 0L), width - max(-columns, 0L))
+    second_rows <- seq(1L + max(-rows, 0L), height - max(rows, 0L))
+    second_columns <- seq(1L + max(-columns, 0L), width - max(columns, 0L))
+    if (!length(first_rows) || !length(first_columns)) next
+    first <- labels[first_rows, first_columns, drop = FALSE]
+    second <- labels[second_rows, second_columns, drop = FALSE]
+    touching <- first > 0L & second > 0L & first != second
+    if (!any(touching)) next
+    one <- as.integer(first[touching])
+    other <- as.integer(second[touching])
+    pairs[[length(pairs) + 1L]] <- cbind(pmin(one, other), pmax(one, other))
+  }
+  if (!length(pairs)) return(matrix(integer(), ncol = 2L))
+  found <- do.call(rbind, pairs)
+  unique(found)
+}
+
+#' One palette slot per object such that no two touching objects share one
+#'
+#' Welsh-Powell: greedy in order of descending degree, which is not optimal in general and
+#' is exact here for the reason the measurement above gives - the graph is planar, so four
+#' colours always suffice, and these graphs are sparse enough that three were enough for
+#' every one of 670 real pictures.
+#'
+#' Ties in degree are broken by ascending label value, because Python's `sorted` is stable
+#' and the engine sorts values already in ascending order. `order()` on the negated degree
+#' is stable the same way, so the two assign the same slot to the same object - which a
+#' pixel-for-pixel test would otherwise fail on a picture where two objects tie.
+#' @keywords internal
+#' @noRd
+instance_colour_index <- function(labels, palette_size) {
+  values <- sort(unique(as.integer(labels[labels > 0L])))
+  if (!length(values)) return(structure(integer(), wrapped = integer()))
+  neighbours <- stats::setNames(vector("list", length(values)), as.character(values))
+  pairs <- instance_adjacent_pairs(labels)
+  for (row in seq_len(nrow(pairs))) {
+    one <- as.character(pairs[row, 1])
+    other <- as.character(pairs[row, 2])
+    neighbours[[one]] <- c(neighbours[[one]], pairs[row, 2])
+    neighbours[[other]] <- c(neighbours[[other]], pairs[row, 1])
+  }
+  degree <- vapply(neighbours, length, integer(1))
+
+  chosen <- stats::setNames(rep(NA_integer_, length(values)), as.character(values))
+  wrapped <- integer()
+  for (value in values[order(-degree)]) {
+    key <- as.character(value)
+    taken <- chosen[as.character(neighbours[[key]])]
+    taken <- taken[!is.na(taken)]
+    slot <- 0L
+    while (slot %in% taken) slot <- slot + 1L
+    # Past the palette the colouring stops being a guarantee and the slot wraps, so two
+    # neighbours get one colour - provably, since a slot is only past the end once every
+    # colour before it was taken by a neighbour. Which objects that happened to is carried
+    # out rather than dropped, and `overlay_instances()` is what reports it, because it is
+    # the function a person called and the only one that knows the palette. The engine warns
+    # from the same place as of `0.8.0a24` and in the same words, which a test compares -
+    # `maju116/pyplatypus#231`. Both packages were silent here until then, and that silence
+    # was a gap rather than a decision: the engine's docstring claimed the report existed.
+    # `palette_size = NULL` asks for the colouring with no palette at all, which is how many
+    # colours the picture needs and cannot be read off a folded run.
+    if (!is.null(palette_size) && slot >= palette_size) {
+      wrapped <- c(wrapped, value)
+      slot <- slot %% palette_size
+    }
+    chosen[[key]] <- slot
+  }
+  structure(chosen, wrapped = sort(wrapped))
+}
+
+#' The pixels of a region that have a non-region pixel among their four neighbours
+#' @keywords internal
+#' @noRd
+instance_outline <- function(where) {
+  inside <- array(TRUE, dim = dim(where))
+  rows <- dim(where)[1]
+  columns <- dim(where)[2]
+  inside[-rows, ] <- inside[-rows, ] & where[-1L, , drop = FALSE]
+  inside[-1L, ] <- inside[-1L, ] & where[-rows, , drop = FALSE]
+  inside[, -columns] <- inside[, -columns] & where[, -1L, drop = FALSE]
+  inside[, -1L] <- inside[, -1L] & where[, -columns, drop = FALSE]
+  where & !inside
+}
+
+#' Mix one colour into a picture where a mask says so
+#' @keywords internal
+#' @noRd
+blend_into <- function(picture, rgb, where, alpha) {
+  flat <- as.vector(where)
+  if (!any(flat)) return(picture)
+  for (channel in 1:3) {
+    layer <- picture[, , channel]
+    layer[flat] <- (1 - alpha) * layer[flat] + alpha * rgb[[channel]]
+    picture[, , channel] <- layer
+  }
+  picture
+}
+
+#' Draw an instance map over its image
+#'
+#' One colour per object, chosen so that **no two touching objects share one**. The rule is
+#' adjacency rather than identity: a colour repeats across the picture and never between
+#' neighbours, because nobody reads object 214 by its colour and everybody needs to see
+#' where one object ends.
+#'
+#' That is an exact graph colouring, and it is affordable rather than clever. Measured over
+#' all 670 Data Science Bowl cases: the hardest needs three colours and `class_colours` has
+#' eight, while the cheap alternative - colour by object number, modulo the palette - draws
+#' one touching pair in ten as a single object.
+#'
+#' Eight-connected, so two objects meeting at a corner get different colours. A label-maker
+#' goes the other way and joins only along edges, because there the risk is merging two
+#' objects into one; here the risk is *drawing* two as one, which is the opposite direction.
+#'
+#' @param image One image: `height x width x 3`, `height x width x 1` or a matrix. Values
+#'   may be 0-1 or 0-255.
+#' @param labels An instance label map - one integer per object, 0 for background. Not a
+#'   one-hot array: an object identity cannot be carried by a channel.
+#' @param alpha How much of the tint shows. Ignored when `outline` is true, where the stroke
+#'   is drawn at full strength, because a translucent outline is a smudge.
+#' @param outline Draw one stroke per object instead of filling it, which leaves the tissue
+#'   entirely visible and is what a pathologist is used to.
+#' @param colours The palette to take slots from. Eight by default, mirrored from the
+#'   engine's own. A picture needing more colours than this has **warns**, naming how many
+#'   it needs and how many objects lost the guarantee: the slot wraps onto a colour a
+#'   neighbour already holds - provably, since it is only past the end once every colour
+#'   before it was taken by a neighbour - so two touching objects are drawn as one and this
+#'   figure answers its own question wrongly. The engine warns in the same words, which is
+#'   checked rather than claimed. Unreachable on anything measured: the hardest of 670 Data
+#'   Science Bowl cases needs three of the eight.
+#' @return A `height x width x 3` array of integers, 0-255.
+#' @seealso [overlay_instance_agreement()] for whether the objects are the right ones,
+#'   [overlay_mask()] for classes rather than objects.
+#' @export
+#' @examples
+#' image <- array(0.5, dim = c(5, 9, 3))
+#' labels <- matrix(0L, nrow = 5, ncol = 9)
+#' labels[2:4, 2:4] <- 1L
+#' labels[2:4, 5:7] <- 2L   # touching object 1 along a seam
+#' shown <- overlay_instances(image, labels)
+#' # Two touching objects, two colours.
+#' !identical(shown[3, 2, ], shown[3, 6, ])
+overlay_instances <- function(image, labels,
+                              alpha = drawing_style()$overlay_alpha,
+                              outline = FALSE,
+                              colours = drawing_style()$class_colours) {
+  if (!length(colours)) {
+    stop("`colours` is empty; there is nothing to draw the objects in.", call. = FALSE)
+  }
+  picture <- as_rgb(image)
+  labels <- as_instance_map(labels, "labels")
+  if (!identical(dim(labels), dim(picture)[1:2])) {
+    stop("the labels are ", paste(dim(labels), collapse = "x"), " and the image is ",
+         paste(dim(picture)[1:2], collapse = "x"), "; they must match.", call. = FALSE)
+  }
+
+  slots <- instance_colour_index(labels, length(colours))
+  wrapped <- attr(slots, "wrapped")
+  if (length(wrapped)) {
+    needed <- max(instance_colour_index(labels, NULL)) + 1L
+    warning(
+      "this picture needs ", needed, " colours to keep every pair of touching objects ",
+      "apart and the palette has ", length(colours), ", so ", length(wrapped), " of ",
+      length(slots), " objects are drawn in a colour one of their own neighbours holds. ",
+      "A slot past the end of the palette wraps onto one a neighbour has already taken - ",
+      "that is what being past the end means - so for those objects the figure no longer ",
+      "answers where one ends and the next begins. Pass a longer `colours`.",
+      call. = FALSE
+    )
+  }
+  for (key in names(slots)) {
+    where <- labels == as.integer(key)
+    picture <- blend_into(
+      picture,
+      grDevices::col2rgb(colours[[slots[[key]] + 1L]])[, 1],
+      if (isTRUE(outline)) instance_outline(where) else where,
+      if (isTRUE(outline)) 1 else alpha
+    )
+  }
+  array(as.integer(round(picture)), dim = dim(picture))
+}
+
+#' Found, missed and invented objects
+#'
+#' [overlay_agreement()] answers the same three-way question about **pixels**, and on an
+#' instance result that is the wrong unit: a merged pair and a split object are both nearly
+#' perfect pixelwise and both wrong, which is exactly what an average precision will not
+#' tell anybody. This matches whole **objects** at one IoU threshold, the way the metric
+#' matches them, so the picture cannot disagree with the number it illustrates.
+#'
+#' @param image One image, as [overlay_instances()] takes it.
+#' @param prediction An instance label map from a model.
+#' @param truth An instance label map from the annotation.
+#' @param threshold The IoU above which a predicted object counts as a true one, strictly
+#'   greater. 0.5 is the loosest of the challenge's ten thresholds, so it is the kindest
+#'   reading, and **below 0.5 is refused** for the reason the metric refuses it: there one
+#'   prediction can satisfy two true objects and the match stops being one to one.
+#' @param alpha How much of the tint shows.
+#' @param colours Named `hit`, `missed` and `false_alarm`, as [overlay_agreement()] takes
+#'   them.
+#' @return A `height x width x 3` array of integers, 0-255.
+#' @seealso [overlay_instances()] for the objects themselves.
+#' @export
+#' @examples
+#' image <- array(0.5, dim = c(5, 11, 3))
+#' truth <- matrix(0L, nrow = 5, ncol = 11)
+#' truth[2:4, 2:4] <- 1L
+#' truth[2:4, 6:8] <- 2L
+#' predicted <- matrix(0L, nrow = 5, ncol = 11)
+#' predicted[2:4, 2:4] <- 1L    # one found
+#' predicted[2:4, 9:11] <- 2L   # one invented, and object 2 missed
+#' shown <- overlay_instance_agreement(image, predicted, truth)
+#' # Three different colours: hit, missed, invented.
+#' nrow(unique(rbind(shown[3, 2, ], shown[3, 6, ], shown[3, 10, ])))
+overlay_instance_agreement <- function(image, prediction, truth, threshold = 0.5,
+                                       alpha = drawing_style()$overlay_alpha,
+                                       colours = drawing_style()$agreement_colours) {
+  if (threshold < 0.5) {
+    stop("`threshold` is ", threshold, ", below 0.5, where one prediction can satisfy two ",
+         "true objects and the match is no longer one to one. The instance average ",
+         "precision refuses the same thing for the same reason, and a figure drawn under a ",
+         "rule the metric rejects is a figure that disagrees with the number it ",
+         "illustrates.", call. = FALSE)
+  }
+  missing <- setdiff(c("hit", "missed", "false_alarm"), names(colours))
+  if (length(missing)) {
+    stop("`colours` is missing ", paste(sort(missing), collapse = ", "),
+         "; all three are needed, because the point of this picture is telling the three ",
+         "apart.", call. = FALSE)
+  }
+
+  picture <- as_rgb(image)
+  predicted <- as_instance_map(prediction, "prediction")
+  actual <- as_instance_map(truth, "truth")
+  if (!identical(dim(predicted), dim(actual))) {
+    stop("the prediction is ", paste(dim(predicted), collapse = "x"), " and the truth is ",
+         paste(dim(actual), collapse = "x"),
+         "; agreement between two arrays of different shapes is not defined.", call. = FALSE)
+  }
+  if (!identical(dim(predicted), dim(picture)[1:2])) {
+    stop("the maps are ", paste(dim(predicted), collapse = "x"), " and the image is ",
+         paste(dim(picture)[1:2], collapse = "x"), "; they must match.", call. = FALSE)
+  }
+
+  matched <- matched_objects(actual, predicted, threshold)
+  hit <- actual > 0L & matrix(as.vector(actual) %in% matched$truth, nrow = nrow(actual))
+  missed <- actual > 0L & !hit
+  invented <- predicted > 0L &
+    !matrix(as.vector(predicted) %in% matched$prediction, nrow = nrow(predicted))
+
+  for (part in c("hit", "missed", "false_alarm")) {
+    where <- switch(part, hit = hit, missed = missed, false_alarm = invented)
+    picture <- blend_into(picture, grDevices::col2rgb(colours[[part]])[, 1], where, alpha)
+  }
+  array(as.integer(round(picture)), dim = dim(picture))
+}
+
+#' Which objects on each side are matched at an IoU threshold
+#'
+#' Every pair above the threshold, with no greedy pass, and that is **equivalent** to the
+#' engine's greedy-on-descending-IoU rather than an approximation of it. The proof is the
+#' same one that makes the metric refuse a threshold below 0.5: if two disjoint true objects
+#' both had IoU above 0.5 with one prediction `p`, each intersection would exceed half of
+#' `p` - because the union is at least `p` - and two disjoint intersections cannot together
+#' exceed `p`. So above 0.5 the matching is one to one whatever order it is taken in, and
+#' the engine's own comment says its one-per-object guard cannot bind there.
+#'
+#' Written this way rather than as a copy of the greedy because `argsort` is not stable: two
+#' pairs at the same IoU come out in an order neither package controls, and a pixel-for-pixel
+#' test against the engine would then fail for a reason that is not a divergence.
+#' @keywords internal
+#' @noRd
+matched_objects <- function(actual, predicted, threshold) {
+  truth_values <- sort(unique(as.integer(actual[actual > 0L])))
+  predicted_values <- sort(unique(as.integer(predicted[predicted > 0L])))
+  if (!length(truth_values) || !length(predicted_values)) {
+    return(list(truth = integer(), prediction = integer()))
+  }
+
+  # One cross-tabulation rather than a loop over pairs: a Data Science Bowl case holds a few
+  # hundred objects, and a few hundred squared comparisons over a 256x256 map each is the
+  # difference between a figure and a wait.
+  counts <- table(factor(as.integer(actual), levels = truth_values),
+                  factor(as.integer(predicted), levels = predicted_values))
+  intersections <- matrix(as.integer(counts), nrow = length(truth_values))
+  truth_sizes <- vapply(truth_values, function(v) sum(actual == v), integer(1))
+  predicted_sizes <- vapply(predicted_values, function(v) sum(predicted == v), integer(1))
+  unions <- outer(truth_sizes, predicted_sizes, "+") - intersections
+  overlaps <- intersections / unions
+
+  above <- which(overlaps > threshold, arr.ind = TRUE)
+  list(truth = truth_values[unique(above[, "row"])],
+       prediction = predicted_values[unique(above[, "col"])])
+}
+
+#' An instance label map, refusing what cannot be one
+#' @keywords internal
+#' @noRd
+as_instance_map <- function(labels, what) {
+  labels <- as.array(labels)
+  if (length(dim(labels)) != 2L) {
+    stop("`", what, "` is ", paste(dim(labels), collapse = "x"),
+         "; an instance map is one integer per pixel, and a one-hot array cannot carry an ",
+         "object identity.", call. = FALSE)
+  }
+  array(as.integer(labels), dim = dim(labels))
+}
+
+#' How big each object is, in units somebody can use
+#'
+#' One row per object. `voxels` is the count, which means nothing outside one scanner, and
+#' `spacing` turns it into a number a reader can compare - the same argument [mask_volume()]
+#' makes for one class, applied per object. That is the question this whole feature is for:
+#' *how many nuclei, and how big is each one*.
+#'
+#' The unit is decided by the rank, and the column is named after it rather than being called
+#' `size` with a note somewhere: `area_mm2` for an image, `volume_ml` for a volume. A column
+#' whose unit lives in the documentation is a column that ends up in a paper as a bare number.
+#'
+#' Without `spacing` there is no such column at all, rather than a count pretending to be a
+#' measurement.
+#'
+#' @param labels An instance label map from `predict()` - one integer per object, 0 for
+#'   background. Two dimensions for an image, three for a volume.
+#' @param spacing The size of one voxel in millimetres: two numbers for an image, three for a
+#'   volume. Unset means the result counts voxels and says nothing about size.
+#' @return A data frame with `object`, `voxels` and, when `spacing` is given, `area_mm2` or
+#'   `volume_ml`. One row per object present, in increasing object number; an object number
+#'   absent from the map gets no row, because a model that found objects 1, 2 and 4 found
+#'   three objects.
+#' @seealso [overlay_instances()] to look at them, [mask_volume()] for one class of a
+#'   semantic mask.
+#' @export
+#' @examples
+#' labels <- matrix(0L, nrow = 8, ncol = 8)
+#' labels[2:4, 2:4] <- 1L
+#' labels[6:7, 6:8] <- 2L
+#' instance_sizes(labels)
+#'
+#' # 0.5 mm pixels: object 1 is 9 pixels, so 9 * 0.25 = 2.25 mm^2.
+#' instance_sizes(labels, spacing = c(0.5, 0.5))
+instance_sizes <- function(labels, spacing = NULL) {
+  labels <- as.array(labels)
+  rank <- length(dim(labels))
+  if (!rank %in% c(2L, 3L)) {
+    stop("`labels` must be one instance map: two dimensions for an image or three for a ",
+         "volume; got ",
+         if (is.null(dim(labels))) "a vector" else paste(dim(labels), collapse = " x "),
+         ". For a stack, apply this to one map at a time - which is also how `predict()` ",
+         "returns them.", call. = FALSE)
+  }
+  bad_spacing <- !is.null(spacing) &&
+    (length(spacing) != rank || anyNA(spacing) || any(spacing <= 0))
+  if (bad_spacing) {
+    stop("`spacing` must be ", rank, " positive numbers, in millimetres, because `labels` ",
+         "has ", rank, " dimensions. Giving ", length(spacing), " would measure a different ",
+         "shape of thing than the one passed.", call. = FALSE)
+  }
+  # Not forwarded, for the reason written out at length in `mask_volume()`: this is a count
+  # times a product, and making it cross the bridge would buy speed with a 5 GB first call.
+  # `test-measure-pair.R` holds it against `pyplatypus.measure.instance_sizes`.
+  values <- sort(unique(as.integer(labels[labels > 0L])))
+  counts <- vapply(values, function(value) sum(labels == value), integer(1))
+  out <- data.frame(object = values, voxels = counts, stringsAsFactors = FALSE)
+  if (is.null(spacing)) return(out)
+
+  per_voxel <- prod(as.numeric(spacing))
+  if (rank == 2L) {
+    out$area_mm2 <- counts * per_voxel
+  } else {
+    # Millilitres rather than cubic millimetres, as `mask_volume()` reports: a millilitre is
+    # a cubic centimetre, which is the unit a radiology report is written in.
+    out$volume_ml <- counts * per_voxel / 1000
+  }
+  out
+}
+
+#' What shape each object is, not just how big
+#'
+#' One row per object, beside the rows [instance_sizes()] gives. `voxels` and `area_mm2`
+#' answer *how big*; these answer *how stretched* - the semi-axes of the ellipse an object's
+#' second moments imply, largest first, and for an image the `eccentricity` that shape
+#' analysis actually reports.
+#'
+#' The fit is not iterative, and it is the same arithmetic [ellipse_measure()] applies to a
+#' whole mask: for a uniform solid the variance along an axis is `semi_axis^2 / (rank + 2)`,
+#' so the axes come out of one eigendecomposition per object. What this adds is that it is
+#' per object **in one pass**: the alternative a caller writes - `ellipse_measure()` on
+#' `labels == k`, once per object - rescans the whole array every time, and on a 512 x 512
+#' map of 1939 objects that is 1989 ms against 143.
+#'
+#' A volume gets three axes and no eccentricity, because an ellipsoid has no single one; the
+#' ratio of two columns is your division rather than a name this package invents.
+#'
+#' @param labels An instance label map from `predict()` - one integer per object, 0 for
+#'   background, the same numbering [instance_sizes()] reads. Two dimensions for an image,
+#'   three for a volume.
+#' @param spacing The size of one voxel in millimetres: two numbers for an image, three for a
+#'   volume, in the array's own order. Unset measures the sampling grid, and the column names
+#'   say so.
+#' @return A data frame with `object` and the semi-axes largest first - `major_mm` and
+#'   `minor_mm` for an image, with `middle_mm` between them for a volume, named `_px` instead
+#'   when `spacing` was not given. An image also gets `eccentricity`. One row per object
+#'   present, in increasing object number; an object with fewer than `rank + 1` voxels has no
+#'   second moment and gets zeros, which is an ordinary outcome rather than an error.
+#'
+#'   **`eccentricity` is unitless and it is not spacing-free.** It describes whichever space
+#'   it was computed in, so on anisotropic voxels the two disagree completely and in both
+#'   directions: a circle of 80 pixels at `spacing = c(2, 1)` reads 0.0000 on the grid and
+#'   0.8660 in millimetres, while an 80 by 40 pixel ellipse at `spacing = c(1, 2)` reads
+#'   0.8667 on the grid and 0.0685 physically - physically almost a circle, which the grid
+#'   calls strongly elongated. Pass your voxel size and read the `_mm` columns unless you
+#'   mean the grid; the suffix on the axes is what says which of the two a row is.
+#' @seealso [instance_sizes()] for how big each object is, [ellipse_measure()] for the same
+#'   fit over a whole mask, and [overlay_instances()] to look at them.
+#' @export
+#' @examples
+#' labels <- matrix(0L, nrow = 41, ncol = 81)
+#' rows <- matrix(rep(seq_len(41), 81), nrow = 41)
+#' columns <- matrix(rep(seq_len(81), each = 41), nrow = 41)
+#' labels[((rows - 21) / 10)^2 + ((columns - 21) / 18)^2 <= 1] <- 1L
+#' labels[(rows - 21)^2 + (columns - 61)^2 <= 81] <- 2L
+#' \dontrun{
+#' # Wrapped because this one crosses to the engine - unlike `instance_sizes()`, which is a
+#' # count times a product and stays in R so that a reader needs no Python to run its page.
+#' # An eigendecomposition per object is not arithmetic a reader verifies by eye, which is
+#' # the line `maju116/pyplatypus#270` drew between the two.
+#' instance_shapes(labels, spacing = c(0.5, 0.5))
+#' }
+instance_shapes <- function(labels, spacing = NULL) {
+  labels <- as.array(labels)
+  rank <- length(dim(labels))
+  if (!rank %in% c(2L, 3L)) {
+    stop("`labels` must be one instance map: two dimensions for an image or three for a ",
+         "volume; got ",
+         if (is.null(dim(labels))) "a vector" else paste(dim(labels), collapse = " x "),
+         ". For a stack, apply this to one map at a time - which is also how `predict()` ",
+         "returns them.", call. = FALSE)
+  }
+  bad_spacing <- !is.null(spacing) &&
+    (length(spacing) != rank || anyNA(spacing) || any(spacing <= 0))
+  if (bad_spacing) {
+    stop("`spacing` must be ", rank, " positive numbers, in millimetres, because `labels` ",
+         "has ", rank, " dimensions. Giving ", length(spacing), " would measure a different ",
+         "shape of thing than the one passed.", call. = FALSE)
+  }
+  # Refused here as well as in the engine, for the reason `instance_sizes()` gives its own
+  # refusals: a crossing costs the engine's first call, and a message about R's argument
+  # should name R's argument. The engine refuses the same two things, which is the pair
+  # `test-measure-pair.R` holds.
+
+  result <- shim()$instance_shape_rows(
+    array(as.integer(labels), dim = dim(labels)),
+    if (is.null(spacing)) NULL else as.numeric(spacing)
+  )
+  if (!isTRUE(result$ok)) abort_engine(result)
+
+  # Built in the order the engine named rather than from the list's own, because a Python
+  # dict's insertion order surviving reticulate is a property nothing here tests. An empty
+  # map has no columns, and a zero-row frame with the right shape is the honest answer.
+  column_names <- as.character(result$names)
+  if (!length(column_names)) {
+    return(data.frame(object = integer(0), stringsAsFactors = FALSE))
+  }
+  columns <- lapply(column_names, function(name) {
+    unlist(result$columns[[name]], use.names = FALSE)
+  })
+  names(columns) <- column_names
+  # No cast on `object`: the shim sends it as a Python `int` and reticulate lands it as an R
+  # integer, measured rather than assumed. A cast here would be a second guarantee of one
+  # fact, which is the shape §3F of the workbench's notes is a list of - and the test asserts
+  # `1L` rather than `1`, so the one guarantee is held where it lives.
+  as.data.frame(columns, stringsAsFactors = FALSE)
+}
+
+#' A vector field as a picture: hue is the direction, value is the length
+#'
+#' The convention optical flow has used for twenty years, and a convention rather than a
+#' palette decision - which is why it is not in [drawing_style()]. Nothing about it is a
+#' choice this project gets to make differently from everyone else's figures, and a reader
+#' who has seen one flow visualisation can read this one.
+#'
+#' What it is for: debugging a `separation_flows()` model. A field that is right everywhere
+#' except reversed looks obviously reversed here and identical in any loss. `predict()` with
+#' `type = "channels"` is where the field comes from.
+#'
+#' A zero vector is black, which is also what the background is, and that is honest - the
+#' background has no direction.
+#'
+#' @param flow A two-channel vector field: `2 x height x width`, channel 1 the row component
+#'   and channel 2 the column component, which is the layout the engine's targets use.
+#' @return A `height x width x 3` array of integers, 0-255.
+#' @seealso [separation_flows()] for the model that predicts one.
+#' @export
+#' @examples
+#' field <- array(0, dim = c(2, 2, 3))
+#' field[1, 1, 1] <- 1   # pointing down
+#' field[2, 1, 2] <- 1   # pointing right
+#' shown <- flow_to_colours(field)
+#' # Two directions, two hues; and no vector, no colour.
+#' !identical(shown[1, 1, ], shown[1, 2, ]) && all(shown[2, 3, ] == 0L)
+flow_to_colours <- function(flow) {
+  field <- as.array(flow)
+  if (length(dim(field)) != 3L || dim(field)[1] != 2L) {
+    stop("`flow` is ",
+         if (is.null(dim(field))) "a vector" else paste(dim(field), collapse = " x "),
+         "; a vector field here is `2 x height x width`, channel 1 the row component and ",
+         "channel 2 the column component.", call. = FALSE)
+  }
+  # `drop = FALSE` and an explicit reshape, because `field[1, , ]` on a `2 x 1 x w` field
+  # drops to a vector and the result then has no dimensions at all. A one-row field is what
+  # a tiled model hands back at the edge of an image, so it is the ordinary case rather than
+  # a contrived one - caught by testing three shapes instead of one.
+  shape <- dim(field)[2:3]
+  rows <- array(field[1, , , drop = FALSE], dim = shape)
+  columns <- array(field[2, , , drop = FALSE], dim = shape)
+  length_of <- sqrt(rows^2 + columns^2)
+  longest <- max(length_of)
+  # `atan2` then wrapped into [0, 1): the same expression the engine uses, because a hue is
+  # an angle and the only way to get a different picture from the same field is to measure
+  # the angle from somewhere else.
+  hue <- (atan2(columns, rows) / (2 * pi)) %% 1
+  value <- if (longest > 0) length_of / longest else array(0, dim = dim(length_of))
+  rgb <- grDevices::hsv(h = as.vector(hue), s = 1, v = as.vector(value))
+  channels <- grDevices::col2rgb(rgb)
+  array(as.integer(t(channels)), dim = c(dim(hue), 3L))
+}

@@ -51,20 +51,74 @@ test_that("the counts are what the engine's own unions hold", {
   # refuse (`pyplatypus#223`). The instance count is asserted beside it rather than only the
   # semantic one, because a listing that merely got shorter and a listing that got right
   # look identical from one number.
-  expect_identical(nrow(available_losses()), 10L)
-  expect_identical(nrow(available_losses("instance_segmentation")), 13L)
+  #
+  # 11 and 14 since the pin moved to 0.8.0a26, which added `generalized_dice` to both - it
+  # scores classes, so it is admissible wherever `dice` is. The two counts move together
+  # for a class loss and apart for a continuous one, which is the thing these two numbers
+  # beside each other are for.
+  expect_identical(nrow(available_losses()), 11L)
+  expect_identical(nrow(available_losses("instance_segmentation")), 14L)
   expect_identical(
     sort(setdiff(
       available_losses("instance_segmentation")$name, available_losses()$name
     )),
     c("l1", "mse", "smooth_l1")
   )
-  expect_identical(nrow(available_metrics()), 4L)
+  # 5 since 0.8.0a26 added `surface_dice`.
+  expect_identical(nrow(available_metrics()), 5L)
   expect_identical(nrow(available_optimizers()), 8L)
-  expect_identical(nrow(available_callbacks()), 7L)
+  # 9 since the pin moved to 0.8.0a33, which added `linear_annealing` and `step_decay`.
+  # Both are schedules, so the engine now refuses two of them at once and refuses any of
+  # them beside `reduce_lr_on_plateau` - a count that grew by two here corresponds to a
+  # configuration surface that got *narrower*, which is the thing one number cannot say.
+  #
+  # 12 since 0.8.0a37 added `ema` - and that release's larger change is invisible here
+  # as well: the callback protocol gained a fourth moment, `on_batch_end`, which is what
+  # makes a per-step average expressible at all.
+  #
+  # 11 since 0.8.0a35 added `terminate_on_collapse`, which acts on a number that is not a
+  # metric: the share of the prediction that is not background, reported every epoch
+  # whether or not anybody asked for it.
+  #
+  # 10 since 0.8.0a34 added `stop_after`. That release also widened three callbacks that
+  # were already here - a warm-up on `early_stopping` and `swa`, conditions on
+  # `model_checkpoint` - and this count cannot see any of it, which is why the arguments
+  # are pinned below rather than only the listing's length.
+  expect_identical(nrow(available_callbacks()), 12L)
+  # Split rather than searched: `arguments` is one comma-joined string, and a `grepl()`
+  # for "start" would also match "start_epoch" - a check that passes for the wrong reason.
+  stopping <- available_callbacks()[available_callbacks()$name == "early_stopping", ]
+  expect_true(all(c("start", "start_epoch") %in% strsplit(stopping$arguments, ", ")[[1]]))
   expect_identical(nrow(available_models()), 4L)
   expect_identical(nrow(available_models("object_detection")), 1L)
-  expect_identical(nrow(available_tasks()), 3L)
+  # 4 since the pin moved to 0.8.0a49, which added `classification`. The engine holds these
+  # rows to `AnySpec`'s own members in both directions, so a task that exists in the
+  # specification and not in this listing fails there rather than here - which is what the
+  # count cannot see and is the reason that pair was written.
+  expect_identical(nrow(available_tasks()), 4L)
+
+  # Classification lists two of the eleven losses - the ones that score each answer on its
+  # own rather than scoring an overlap - and four metrics of its own, which share no name
+  # with the mask metrics above. Named rather than counted here, because the names are the
+  # claim: a count of 2 would also pass on the wrong two.
+  expect_identical(sort(available_losses("classification")$name), c("cce", "focal"))
+  expect_identical(
+    sort(available_metrics("classification")$name),
+    c("accuracy", "auc", "balanced_accuracy", "f1")
+  )
+  expect_identical(
+    intersect(available_metrics("classification")$name, available_metrics()$name),
+    character(0)
+  )
+})
+
+test_that("classification says it chooses no architecture rather than listing none", {
+  skip_if_no_engine()
+  # The same shape as detection's refusal below and a different fact: there is no
+  # `architecture` field for this task at all, because the contracting path is the network
+  # and `encoder` decides whose it is. An empty table would read as "there are none".
+  expect_error(available_models("classification"), class = "platypus_error")
+  expect_error(available_models("classification"), "encoder")
 })
 
 test_that("arguments are a readable column and recover their parts", {
@@ -123,16 +177,18 @@ test_that("the third task answers with losses rather than with a refusal", {
 })
 
 test_that("the family is spelled one way across both packages", {
-  # §3A: one concept, one name. Seven exported functions answering "what can this do",
-  # and `show_available_*` for any of them would be the divergence the rule exists to
-  # prevent. Checked against the namespace rather than by reading the file.
+  # §3A: one concept, one name. Ten exported functions answering "what can this do", and
+  # `show_available_*` for any of them would be the divergence the rule exists to prevent.
+  # Checked against the namespace rather than by reading the file - which is what caught
+  # `available_separations` and `available_decodings` arriving on 2026-10-15, and the eight
+  # above them are the engine's ten minus those two for as long as this list said eight.
   exported <- getNamespaceExports("rplatypus")
   family <- sort(grep("^available_", exported, value = TRUE))
   expect_identical(
     family,
-    c("available_callbacks", "available_losses", "available_metrics", "available_models",
-      "available_optimizers", "available_tasks", "available_transforms",
-      "available_weights")
+    c("available_callbacks", "available_decodings", "available_losses", "available_metrics",
+      "available_models", "available_optimizers", "available_separations",
+      "available_tasks", "available_transforms", "available_weights")
   )
   expect_identical(length(grep("^show_available", exported, value = TRUE)), 0L)
 })

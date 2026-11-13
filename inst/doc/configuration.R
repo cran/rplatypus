@@ -36,6 +36,33 @@ knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE, error = FAL
 
 ## -----------------------------------------------------------------------------
 # spec <- platypus_spec(
+#   data = segmentation_data(
+#     "data/train", "data/validation",
+#     regions = list(
+#       list(name = "whole tumour", of = c(1, 2, 4)),
+#       list(name = "tumour core", of = c(1, 4)),
+#       list(name = "enhancing", of = 4)
+#     )
+#   ),
+#   models = list(u_net("brats", input_shape = c(240, 240), loss = loss_focal()))
+# )
+
+## -----------------------------------------------------------------------------
+# inspect_masks(spec)
+# #>   split unmatched samples_checked total_samples present_classes      missing_classes
+# #> 1 train    0.0000             500          1251 whole tumour, ...    enhancing
+
+## -----------------------------------------------------------------------------
+# spec <- platypus_spec(
+#   data = segmentation_data(
+#     "data/train", "data/validation",
+#     classes_from = c("_vessel\\.png$", "_organ\\.png$")
+#   ),
+#   models = list(u_net("crossing", input_shape = c(256, 256)))
+# )
+
+## -----------------------------------------------------------------------------
+# spec <- platypus_spec(
 #   data = instance_data("data/train", "data/validation"),
 #   models = list(
 #     u_net(
@@ -54,6 +81,34 @@ knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE, error = FAL
 # )
 # fit <- platypus_fit(spec)
 # evaluate(fit)
+
+## -----------------------------------------------------------------------------
+# spec <- platypus_spec(
+#   data = classification_data("data/train", "data/validation",
+#                              classes = c("benign", "malignant")),
+#   models = list(
+#     classifier("ours", input_shape = c(128, 128), blocks = 4, filters = 16,
+#                loss = loss_cce(),
+#                metrics = list(metric_auc(), metric_balanced_accuracy())),
+#     classifier("resnet", input_shape = c(224, 224), encoder = "resnet34",
+#                pretrained = TRUE, freeze_encoder = 2, pooling = "max",
+#                head_dropout = 0.2, loss = loss_focal(gamma = 2))
+#   )
+# )
+
+## -----------------------------------------------------------------------------
+# spec <- platypus_spec(
+#   data = classification_data(
+#     "data/train.csv", "data/validation.csv",
+#     classes = c("atelectasis", "effusion", "nodule", "mass"),
+#     labels_from = c("Atelectasis", "Effusion", "Nodule", "Mass"),
+#     mode = "config_file"
+#   ),
+#   models = list(
+#     classifier("ours", input_shape = c(224, 224), blocks = 4, filters = 16,
+#                loss = loss_cce(), metrics = list(metric_auc(), metric_f1()))
+#   )
+# )
 
 ## -----------------------------------------------------------------------------
 # spec <- platypus_spec("run.yaml")

@@ -16,17 +16,51 @@
 #' @param channels 3 for colour, 1 for greyscale.
 #' @param nearest Use nearest-neighbour resizing. Required for masks: interpolating one
 #'   invents colours belonging to no class, which then quietly become background.
-#' @return An `image x height x width x channels` array of 0-255 values.
+#' @param label_map The file holds class identities rather than brightness, so read it at
+#'   full integer width. A 16-bit PNG or a 32-bit TIFF label map is otherwise read through
+#'   8-bit greyscale, where every value above 255 arrives as 255 - two classes then merge
+#'   into one with nothing unmatched to say so. One channel only, because a label map has
+#'   one, and never for an image: a picture is divided by 255 later.
+#'
+#'   **For a volume this argument does nothing and `nearest` is what matters**, which is
+#'   the engine's own rule rather than this package's: a NIfTI or a DICOM series never went
+#'   through an 8-bit conversion, so there is no width to widen, and the flag that says
+#'   *these numbers are classes* on that route is `nearest`. Passing `label_map = TRUE`
+#'   alone on a volume returns the values divided by the largest one. Pass both.
+#' @return An `image x height x width x channels` array of 0-255 values - or of the file's
+#'   own integer values with `label_map = TRUE` **and**, for a volume, `nearest = TRUE`.
+#'   A volume read with `label_map = TRUE` and `nearest = FALSE` comes back rescaled to
+#'   0-1, and this function warns when it is asked for that combination.
 #' @export
 #' @examples
 #' \dontrun{
 #' images <- read_images(list.files("test/", full.names = TRUE), size = c(256, 256))
+#'
+#' # A label map stored wide, whose values are classes rather than brightness.
+#' values <- read_images("seg.png", channels = 1, nearest = TRUE, label_map = TRUE)
 #' }
-read_images <- function(paths, size = NULL, channels = 3, nearest = FALSE) {
+read_images <- function(paths, size = NULL, channels = 3, nearest = FALSE,
+                        label_map = FALSE) {
+  # `label_map` is a PIL-mode argument: the engine documents it as ignored for volume
+  # formats, "which never went through an 8-bit conversion", and `volumes._rescale` says
+  # `nearest` is how a caller says "these are labels" on that route. So this combination is
+  # always a mistake - the caller has asked for the file's values and would get them divided
+  # by the largest one - and a warning is what says so. Not a refusal: a path is not read
+  # here, so this cannot know whether any of these files is a volume.
+  # `maju116/rplatypus#266`.
+  if (isTRUE(label_map) && !isTRUE(nearest)) {
+    warning(
+      "`label_map = TRUE` with `nearest = FALSE`: on a volume (NIfTI, DICOM) the engine ",
+      "ignores `label_map` and rescales the values to 0-1, so the classes come back ",
+      "divided by the largest label. Pass `nearest = TRUE` as well for a label map.",
+      call. = FALSE
+    )
+  }
   result <- shim()$read_images(as.list(as.character(paths)),
                                channels = as.integer(channels),
                                size = if (is.null(size)) NULL else as.integer(size),
-                               nearest = nearest)
+                               nearest = nearest,
+                               label_map = label_map)
   if (!isTRUE(result$ok)) abort_engine(result)
   result$images
 }
@@ -142,7 +176,8 @@ plot_masks <- function(images, prediction = NULL, truth = NULL,
 #'
 #' @param x A [platypus_fit()].
 #' @param metrics Which columns to plot; defaults to the losses and metrics.
-#' @param ... Unused.
+#' @param ... Must be empty; a misspelt argument is refused rather than ignored,
+#'   which is what it used to be. `maju116/rplatypus#315`.
 #' @return A `ggplot`.
 #' @importFrom rlang .data
 #' @export
@@ -152,6 +187,7 @@ plot_masks <- function(images, prediction = NULL, truth = NULL,
 #' plot(fit, metrics = "dice")
 #' }
 plot.platypus_fit <- function(x, metrics = NULL, ...) {
+  rlang::check_dots_empty()  # `#315`; see `evaluate.platypus_fit` for why it is first
   if (!requireNamespace("ggplot2", quietly = TRUE)) {
     stop("plotting a fit needs the ggplot2 package.", call. = FALSE)
   }

@@ -139,8 +139,12 @@ test_that("a mask that does not match its scan is refused rather than written", 
   scan <- list.files(root, pattern = "ct[.]nii[.]gz$", recursive = TRUE,
                      full.names = TRUE)
   wrong_size <- array(1L, dim = c(1, 4, 4, 2))
+  # The wording is the engine's since the pin moved to `0.8.0a30`: this package forwards the
+  # write now rather than carrying its own nibabel loop, so the refusal arrives from there.
+  # Matched on the clause that is the finding rather than on the shapes, which differ per
+  # fixture.
   expect_error(save_volumes(wrong_size, withr::local_tempdir(), reference = scan),
-               "does not match")
+               "lands in the wrong place")
 })
 
 test_that("masks and reference volumes have to line up", {
@@ -559,7 +563,7 @@ test_that("a prediction on the model's grid is still refused, with the reason", 
   expect_error(
     save_volumes(predict(fit, split = "validation"), withr::local_tempdir(),
                  reference = scan),
-    "does not match"
+    "lands in the wrong place"
   )
 })
 
@@ -605,4 +609,190 @@ test_that("masks that would overwrite each other are refused", {
   written <- save_volumes(masks, withr::local_tempdir(), reference = scans,
                           names = c("case_a", "case_b", "case_c"))
   expect_length(unique(basename(written)), 3)
+})
+
+
+# --- overlapping classes have no label map, and this is the case `regions` was built for --
+#
+# BraTS names three overlapping regions and stores them as volumes, so the volume writer is
+# where this matters most - and `#152` named `save_masks()` while `save_volumes()` reduced a
+# prediction in **two** places: a 4-dimensional array inside a list and a 5-dimensional
+# stack. A label-map NIfTI holds one integer per voxel, so there is nothing an overlap could
+# be written as.
+
+overlapping_volumes <- function(cases = 2L, shape = c(8, 8, 4)) {
+  # A label map of {0, 1, 2} turned into unions, so the overlap is a consequence of the data
+  # rather than something a test asserted into existence.
+  labels <- array(0L, dim = shape)
+  labels[1:4, , ] <- 1L
+  labels[5:8, , ] <- 2L
+  channels <- lapply(list(c(1, 2), 2), function(of) as.numeric(labels %in% of))
+  one <- array(unlist(channels), dim = c(shape, 2L))
+  lapply(seq_len(cases), function(i) one)
+}
+
+test_that("save_volumes refuses an overlapping prediction in a list", {
+  expect_error(
+    save_volumes(overlapping_volumes(), withr::local_tempdir(), reference = c("a", "b")),
+    "2 classes at once"
+  )
+  expect_error(
+    save_volumes(overlapping_volumes(), withr::local_tempdir(), reference = c("a", "b")),
+    "save_class_volumes"
+  )
+})
+
+test_that("save_volumes refuses an overlapping prediction as a stack", {
+  stacked <- array(unlist(overlapping_volumes(cases = 2L)), dim = c(2, 8, 8, 4, 2))
+  expect_error(
+    save_volumes(stacked, withr::local_tempdir(), reference = c("a", "b")),
+    "2 classes at once"
+  )
+})
+
+test_that("an exclusive volume prediction is still reduced rather than refused", {
+  # The control, and the one that matters: a softmax prediction must pass both of the places
+  # the refusal was added, or every ordinary volume run would start failing.
+  skip_if_no_volumes()
+  root <- tiny_volume_dataset(cases = 1)
+  scan <- list.files(root, pattern = "ct[.]nii[.]gz$", recursive = TRUE, full.names = TRUE)
+  softmax <- array(0, dim = c(8, 8, 4, 2))
+  softmax[, , , 1] <- 0.7
+  softmax[, , , 2] <- 0.3
+  written <- save_volumes(list(softmax), withr::local_tempdir(), reference = scan)
+  expect_length(written, 1L)
+  stacked <- array(softmax, dim = c(1, 8, 8, 4, 2))
+  expect_length(save_volumes(stacked, withr::local_tempdir(), reference = scan), 1L)
+})
+
+test_that("save_class_volumes writes one NIfTI per class, carrying the scan's geometry", {
+  skip_if_no_volumes()
+  root <- tiny_volume_dataset(cases = 2)
+  scans <- sort(list.files(root, pattern = "ct[.]nii[.]gz$", recursive = TRUE,
+                           full.names = TRUE))
+  out <- withr::local_tempdir()
+  written <- save_class_volumes(
+    overlapping_volumes(cases = 2L), out, reference = scans,
+    classes = c("whole tumour", "enhancing"),
+    names = c("case_a", "case_b")
+  )
+
+  # Volume by volume, class within volume - the order a caller zips against its case names.
+  expect_identical(
+    basename(written),
+    c("case_a_whole_tumour.nii.gz", "case_a_enhancing.nii.gz",
+      "case_b_whole_tumour.nii.gz", "case_b_enhancing.nii.gz")
+  )
+  # Read back the content, not the count: a writer that put the same channel in both would
+  # pass a test that only looked at the names. `whole tumour` is both halves, `enhancing` is
+  # the second half alone, and the overlap is what no label map could have held.
+  read_back <- function(path) {
+    reticulate::py_run_string(sprintf(
+      "import nibabel as nib, numpy as np\nout = np.asarray(nib.load(%s).dataobj)",
+      shQuote(path, type = "cmd")
+    ))$out
+  }
+  whole <- read_back(file.path(out, "case_a_whole_tumour.nii.gz"))
+  enhancing <- read_back(file.path(out, "case_a_enhancing.nii.gz"))
+  expect_true(all(whole == 1L))
+  expect_true(all(enhancing[1:4, , ] == 0L))
+  expect_true(all(enhancing[5:8, , ] == 1L))
+
+  # And the geometry, which is the only reason this is not `save_class_masks()` with another
+  # extension: every class of a scan carries that scan's spacing.
+  expect_equal(volume_info(written)$spacing_3, rep(volume_info(scans)$spacing_3, each = 2))
+})
+
+test_that("save_class_volumes counts its class names against the channels", {
+  # THE ENGINE'S REFUSAL RATHER THAN THIS PACKAGE'S, which is why it needs the skip its
+  # neighbours have. `save_class_volumes()` checks `reference` and `names` in R and forwards
+  # the rest, and the comment at that call says so by name: the channel count against the
+  # class names is the engine's, and the copy that used to live here went with
+  # `pyplatypus 0.8.0a29`. Without this line the call reaches the bridge on a machine with no
+  # engine, and that is how `0.3.0` was rejected by CRAN's incoming checks - 1 ERROR on
+  # r-devel-windows, `No module named 'pyplatypus'` raised where a refusal was expected.
+  skip_if_no_volumes()
+  expect_error(
+    save_class_volumes(overlapping_volumes(), withr::local_tempdir(),
+                       reference = c("a", "b"), classes = "only one"),
+    "2 channels and 1 class names"
+  )
+})
+
+test_that("save_class_volumes refuses two class names that become one file", {
+  # The engine's too - it owns the per-class filenames. See the test above.
+  skip_if_no_volumes()
+  expect_error(
+    save_class_volumes(overlapping_volumes(), withr::local_tempdir(),
+                       reference = c("a", "b"), classes = c("core 1", "core_1")),
+    "same filename"
+  )
+})
+
+test_that("save_class_volumes states the ranks it takes rather than guessing", {
+  # Unlike `save_volumes()`, no rank here is ambiguous: a prediction with a class axis always
+  # has one dimension more than the volume, so there is nothing to guess between.
+  expect_error(
+    save_class_volumes(array(1L, dim = c(8, 8, 4)), withr::local_tempdir(),
+                       reference = "a", classes = c("x", "y")),
+    "3 dimensions; expected 4"
+  )
+})
+
+test_that("the engine names a class file, and this package no longer has an opinion", {
+  # This replaces a §3F pair rather than dropping one. The test that stood here compared
+  # `rplatypus:::class_file_names()` against the engine's `class_filename` over awkward
+  # names, because `save_class_volumes()` could not forward and had to carry the rule
+  # itself. `pyplatypus 0.8.0a29` moved the volume writer into the engine, so the second
+  # copy is gone - and what is worth checking is no longer that two rules agree but that
+  # the one rule is what reaches disk from here, on names that are awkward for a path.
+  skip_if_no_volumes()
+  root <- tiny_volume_dataset(cases = 2)
+  scans <- sort(list.files(root, pattern = "ct[.]nii[.]gz$", recursive = TRUE,
+                           full.names = TRUE))
+  written <- save_class_volumes(
+    overlapping_volumes(), withr::local_tempdir(), reference = scans,
+    classes = c("whole tumour", "Core / rim"), names = c("case_01", "case_02")
+  )
+  expect_identical(
+    basename(written),
+    c("case_01_whole_tumour.nii.gz", "case_01_Core_rim.nii.gz",
+      "case_02_whole_tumour.nii.gz", "case_02_Core_rim.nii.gz")
+  )
+})
+
+test_that("a writer takes the named list `predict()` now returns, straight through", {
+  # The user path, and a regression this package shipped for about an hour.
+  # `maju116/rplatypus#223` made `predict(space = "source")` return a list NAMED by case,
+  # which is what makes it joinable - and reticulate converts a named R list into a Python
+  # `dict` where an unnamed one becomes a `list`. So the writer stopped being able to read
+  # its own input, and the message it refused with was about a shape it never got to read.
+  #
+  # The existing tests above missed it for one reason: every one of them builds its list by
+  # hand or unnames it on the way. This one takes what `predict()` gives and hands it over
+  # untouched, which is the only shape a reader of `?save_volumes` would write.
+  skip_if_no_source_space()
+  root <- tiny_volume_dataset(cases = 2, shape = c(16, 16, 8), spacing = c(1, 1, 2))
+  scans <- sort(list.files(root, pattern = "ct[.]nii[.]gz$", recursive = TRUE,
+                           full.names = TRUE))
+  spec <- platypus_spec(
+    data = segmentation_data(root, root, labels = c(0, 1), window = "soft_tissue",
+                             target_spacing = c(1, 1, 1)),
+    models = list(u_net("u", input_shape = c(8, 8, 8), channels = 1, blocks = 2, filters = 4,
+                        epochs = 1, batch_size = 1))
+  )
+  fit <- platypus_fit(spec, num_workers = 0)
+
+  masks <- predict(fit, split = "validation", space = "source")
+  # The control: if this list were unnamed the test would be the one above again, and the
+  # conversion it is about could not happen.
+  expect_false(is.null(names(masks)))
+
+  written <- save_volumes(masks, withr::local_tempdir(), reference = scans,
+                          names = names(masks))
+  expect_length(written, 2)
+  expect_true(all(file.exists(written)))
+  # And the names reached the filenames, which is the thing having them was for.
+  expect_setequal(tools::file_path_sans_ext(tools::file_path_sans_ext(basename(written))),
+                  names(masks))
 })

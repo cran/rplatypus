@@ -98,6 +98,104 @@ for i in range(%d):
   root
 }
 
+#' Images in class directories, which is what `nested_dirs` means for a classifier
+#'
+#' Two classes, and the difference between them is **learnable in one epoch on purpose**: a
+#' fixture whose classes a model cannot separate would report a trained run and an untrained
+#' one as the same thing, which is §4's probe answering an adjacent question. `bright`
+#' carries a square and `dark` does not, so a single pooled feature divides them - and the
+#' test that checks a fit learned anything is what that is for.
+#'
+#' Balanced, so that nothing here depends on the prevalence argument the engine's own
+#' metric choice was made from: an unbalanced fixture would make `accuracy` and `auc` move
+#' together and hide exactly the distinction this task's default is about.
+tiny_classification_dataset <- function(per_class = 4, size = 32) {
+  root <- withr::local_tempdir(.local_envir = parent.frame())
+  reticulate::py_run_string(sprintf("
+import numpy as np, pathlib
+from PIL import Image
+root = pathlib.Path(%s)
+rng = np.random.default_rng(0)
+for name in ('dark', 'bright'):
+    (root / name).mkdir(parents=True, exist_ok=True)
+for i in range(%d):
+    for name in ('dark', 'bright'):
+        picture = rng.random((%d, %d)) * 60
+        if name == 'bright':
+            picture[8:24, 8:24] += 170
+        image = np.clip(picture, 0, 255).astype(np.uint8)
+        Image.fromarray(image).convert('RGB').save(root / name / f'{name}_{i:02d}.png')
+", shQuote(root), per_class, size, size))
+  root
+}
+
+tiny_classification_spec <- function(root, ...) {
+  platypus_spec(
+    data = classification_data(root, root, classes = c("dark", "bright")),
+    models = list(classifier("tiny", input_shape = c(32, 32), blocks = 2, filters = 4,
+                             epochs = 1, batch_size = 2, ...))
+  )
+}
+
+#' A tiny dataset whose label is a SET, written the way `labels_from` reads it
+#'
+#' One CSV, one column per class, cells `0` or `1`. The two findings are made separable on
+#' purpose - `bright` is a square in the middle and `wide` a bar down the side - so a model
+#' with one epoch has something to learn and the test is about the route rather than about
+#' whether a model trains. Every combination occurs, including the row with neither, which
+#' is the commonest row in a dataset shaped this way and the one an empty cell would hide.
+tiny_multilabel_dataset <- function(per_combination = 3, size = 32) {
+  root <- withr::local_tempdir(.local_envir = parent.frame())
+  reticulate::py_run_string(sprintf("
+import csv, numpy as np, pathlib
+from PIL import Image
+root = pathlib.Path(%s)
+root.mkdir(parents=True, exist_ok=True)
+rng = np.random.default_rng(0)
+rows = []
+for i in range(%d):
+    for bright in (0, 1):
+        for wide in (0, 1):
+            picture = rng.random((%d, %d)) * 60
+            if bright:
+                picture[8:24, 8:24] += 170
+            if wide:
+                picture[:, 0:6] += 170
+            name = f'case_{i}_{bright}{wide}.png'
+            Image.fromarray(np.clip(picture, 0, 255).astype(np.uint8)).convert('RGB').save(
+                root / name)
+            rows.append((name.removesuffix('.png'), name, bright, wide))
+with (root / 'all.csv').open('w', newline='') as handle:
+    writer = csv.writer(handle)
+    writer.writerow(['key', 'images', 'Bright', 'Wide'])
+    writer.writerows(rows)
+", shQuote(root), per_combination, size, size))
+  file.path(root, "all.csv")
+}
+
+#' The same images listed with NO class columns, which is a prediction set
+#'
+#' Written beside `all.csv` rather than instead of it, so one dataset serves both halves of
+#' the distinction `rplatypus#245` is about: a film carrying none of the findings is
+#' labelled and reads FALSE, and an image nobody labelled reads NA. Either alone proves
+#' nothing.
+tiny_unlabelled_csv <- function(labelled_csv) {
+  rows <- utils::read.csv(labelled_csv)
+  path <- file.path(dirname(labelled_csv), "images-only.csv")
+  utils::write.csv(rows[, c("key", "images")], path, row.names = FALSE, quote = FALSE)
+  path
+}
+
+tiny_multilabel_spec <- function(path, ...) {
+  platypus_spec(
+    data = classification_data(path, path, classes = c("bright", "wide"),
+                               labels_from = c("Bright", "Wide"),
+                               mode = "config_file"),
+    models = list(classifier("tiny", input_shape = c(32, 32), blocks = 2, filters = 4,
+                             epochs = 1, batch_size = 2, ...))
+  )
+}
+
 tiny_instance_spec <- function(root, ...) {
   platypus_spec(
     data = instance_data(root, root),
@@ -230,6 +328,42 @@ for n in range(%d):
 # must not be indented, so the arguments that follow cannot align under sprintf(.
 ", shQuote(root), shape[1], shape[2], shape[3],
    spacing[1], spacing[2], spacing[3], cases))  # nolint: indentation_linter.
+  root
+}
+
+
+#' A dataset of NIfTI volumes whose masks are label maps with two classes
+#'
+#' Two shapes of the same data, and the second is why this exists rather than a flag on
+#' `tiny_volume_dataset()`. With `background = TRUE` the masks hold 0, 1 and 2, so
+#' `labels = c(1, 2)` leaves every background voxel matching nothing. With
+#' `background = FALSE` every voxel is 1 or 2, so the same `labels` is **correct** and has
+#' to keep working.
+#'
+#' A fixture that could only produce the first would make "refuse whenever 0 is missing"
+#' indistinguishable from what the engine actually does, which is to refuse only when the
+#' data has unmatched voxels. §4's probe that cannot fail for the reason it is asking about.
+tiny_label_dataset <- function(background = TRUE, cases = 4, shape = c(8, 8, 4),
+                               envir = parent.frame()) {
+  root <- withr::local_tempdir(.local_envir = envir)
+  reticulate::py_run_string(sprintf("
+import numpy as np, pathlib, nibabel as nib
+root = pathlib.Path(%s)
+shape = (%d, %d, %d)
+affine = np.diag([2.0, 2.0, 5.0, 1.0])
+background = %s
+for n in range(%d):
+    sample = root / f'case_{n:02d}'
+    (sample / 'images').mkdir(parents=True, exist_ok=True)
+    (sample / 'masks').mkdir(parents=True, exist_ok=True)
+    labels = np.zeros(shape, np.float32) if background else np.ones(shape, np.float32)
+    labels[2:6, 2:6, 1:3] = 1
+    labels[0:2, 0:8, 0:4] = 2
+    scan = np.where(labels > 1, 40.0, -1000.0).astype(np.float32)
+    nib.save(nib.Nifti1Image(scan, affine), str(sample / 'images' / 'ct.nii.gz'))
+    nib.save(nib.Nifti1Image(labels, affine), str(sample / 'masks' / 'seg.nii.gz'))
+", shQuote(root), shape[1], shape[2], shape[3],
+   if (background) "True" else "False", cases))  # nolint: indentation_linter.
   root
 }
 
@@ -457,6 +591,70 @@ engine_has_encoders <- function() {
     )
     isTRUE(result$ok)
   }, error = function(e) FALSE))
+}
+
+#' Does the engine in use understand `regions`?
+#'
+#' Offered the field rather than asked for a version, the way the encoder probe is - and
+#' with `task` present for the same reason it learnt: without it the engine refuses the
+#' configuration for a reason that has nothing to do with `regions`, this reads that
+#' refusal as "no such field", and every regions test skips against an engine that
+#' supports them. Two entries because the schema's minimum is two, so one would be
+#' refused by an engine that has the field.
+engine_has_regions <- function() {
+  if (!engine_available()) return(FALSE)
+  isTRUE(tryCatch({
+    result <- rplatypus:::shim()$build_spec(
+      list(
+        task = "semantic_segmentation",
+        data = list(train_path = ".", validation_path = ".",
+                    regions = list(list(name = "a", of = list(1L)),
+                                   list(name = "b", of = list(2L)))),
+        models = list(list(name = "probe", input_shape = c(64L, 64L)))
+      ),
+      check_paths = FALSE
+    )
+    isTRUE(result$ok)
+  }, error = function(e) FALSE))
+}
+
+#' Does the engine in use understand `classes_from`?
+#'
+#' The same probe as `regions`, for the same reason and with the same two lessons built in:
+#' `task` is present, because without it the engine refuses the configuration for a reason
+#' that has nothing to do with the field and every test here would skip against an engine
+#' that supports it; and there are two patterns, because the schema's minimum is two, so one
+#' would be refused by an engine that has the field.
+engine_has_classes_from <- function() {
+  if (!engine_available()) return(FALSE)
+  isTRUE(tryCatch({
+    result <- rplatypus:::shim()$build_spec(
+      list(
+        task = "semantic_segmentation",
+        data = list(train_path = ".", validation_path = ".",
+                    classes_from = list("_vessel\\.png$", "_organ\\.png$")),
+        models = list(list(name = "probe", input_shape = c(64L, 64L)))
+      ),
+      check_paths = FALSE
+    )
+    isTRUE(result$ok)
+  }, error = function(e) FALSE))
+}
+
+skip_if_no_classes_from <- function() {
+  skip_if_no_engine()
+  testthat::skip_if_not(
+    engine_has_classes_from(),
+    "the engine in use predates `classes_from`"
+  )
+}
+
+skip_if_no_regions <- function() {
+  skip_if_no_engine()
+  testthat::skip_if_not(
+    engine_has_regions(),
+    "the engine in use predates `regions`"
+  )
 }
 
 skip_if_no_encoders <- function() {

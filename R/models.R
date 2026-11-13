@@ -84,7 +84,20 @@
 #'   Focal-Tversky of 0.05 is not better than a cross-entropy of 0.14, it is a different
 #'   question, which is why the table carries the loss's name beside the number. Unset uses
 #'   the engine's default.
-#' @param metrics A list of metrics, see [metrics].
+#' @param metrics A list of metrics, see [metrics]. These are reported beside the loss and
+#'   are **computed on the mask rather than on the objective**, which is what makes them
+#'   comparable between models: a Focal-Tversky of 0.05 and a CCE-Dice of 0.14 are not the
+#'   same question, and their Dice is.
+#'
+#'   A callback watching `val_<metric>` is refused when nothing in this list will produce
+#'   it - when the configuration is read, rather than at the end of the first epoch with
+#'   the epoch already paid for. Which is also why a tiled run refuses a callback watching
+#'   `val_cldice` or `val_surface_dice`: those are properties of a whole mask, reported per
+#'   case rather than per epoch, so the choice to tile and the choice of what to stop on
+#'   are settled together.
+#'
+#'   For a classifier the list is a different family - see [classification_metrics], where
+#'   none of these names appears and the default is measured rather than chosen.
 #' @param optimizer An optimiser, see [optimizers].
 #' @param callbacks A list of callbacks, see [callbacks].
 #' @param augmentation A list of [augmentation_step()] steps, applied to training data only.
@@ -107,6 +120,16 @@
 #'   purpose, so naming an architecture never reaches the network on a machine that has
 #'   none. Measured on three datasets, transfer does not beat the built-in encoder here -
 #'   see [encoders] for the table and what it is actually good for.
+#' @param normalise Normalise the input with the backbone's own ImageNet statistics.
+#'   Defaults to `pretrained`, which is what it meant before it was a setting, so leaving
+#'   it alone changes nothing. It exists to be set `TRUE` **with** `pretrained = FALSE`,
+#'   which is the only way to reload weights you exported from a pretrained encoder on a
+#'   machine with no network: the statistics come from the backbone's own configuration and
+#'   need no download, while the weights themselves are yours. It is recorded in the
+#'   weights' fingerprint either way, so a mismatch is refused by name rather than
+#'   silently predicting something else. Setting it `TRUE` needs `encoder`: the statistics
+#'   belong to a backbone and the built-in encoder has none, so without one it is refused
+#'   rather than quietly ignored.
 #' @param freeze_encoder Hold the transferred layers still for this many epochs, then
 #'   train them. **Use this rather than `encoder_learning_rate` alone**: it was the better
 #'   of the two on all three datasets measured. A number at or above `epochs` keeps them
@@ -121,6 +144,18 @@
 #'   instances, which is how a specification knows its task without anybody typing it. The
 #'   data has to be [instance_data()] to match. The head's width follows from the signal and
 #'   the number of classes and is derived rather than stated.
+#'
+#'   **It may be left out when `weights` names a file that records it**, since pyplatypus
+#'   `0.8.0a28`: a published sidecar says what the channels were trained to predict, and
+#'   `"dsbowl-instances"` is a rim of width 2 - a training decision rather than a shape, and
+#'   nothing a reader can guess from a model card. So
+#'   `u_net("objects", input_shape = c(256, 256), weights = "dsbowl-instances")` beside
+#'   [instance_data()] is an instance model, and the engine prints what it adopted.
+#'
+#'   Left out with **no** `weights` it is still semantic, and still refused beside
+#'   [instance_data()] as two tasks in one specification - which is the pair that would
+#'   otherwise be silent: the same layout and the same architecture, differing only in
+#'   whether a signal is predicted at all. `maju116/rplatypus#181`.
 #' @param decode A **list** of [decodings] turning those channels into objects, e.g.
 #'   `list(decode_nearest_seed(), decode_connected_components())`. A list rather than one,
 #'   because several decodings share a single forward pass: a second costs seconds where a
@@ -146,7 +181,7 @@ segmentation_model <- function(architecture, name, input_shape, channels, n_clas
                                upsample, deep_supervision, activation, initialiser,
                                loss, metrics, optimizer, callbacks, augmentation,
                                epochs, batch_size, splits, weights, fit,
-                               encoder, pretrained, freeze_encoder,
+                               encoder, pretrained, normalise, freeze_encoder,
                                encoder_learning_rate, separation, decode) {
   if (!is.null(n_class)) {
     stop("`n_class` is not a model setting: the number of classes comes from the data, ",
@@ -189,6 +224,7 @@ segmentation_model <- function(architecture, name, input_shape, channels, n_clas
     fit = fit,
     encoder = encoder,
     pretrained = pretrained,
+    normalise = normalise,
     freeze_encoder = if (is.null(freeze_encoder)) NULL else int1(freeze_encoder),
     encoder_learning_rate = encoder_learning_rate,
     separation = separation,
@@ -201,8 +237,19 @@ segmentation_model <- function(architecture, name, input_shape, channels, n_clas
   # `task` stays read off the constructors rather than typed. `decode` alone is not enough
   # to tag on: it is optional, and a model that decoded without predicting a signal would
   # be a specification with no way to produce one.
-  if (is.null(separation)) return(built)
-  structure(built, task = "instance_segmentation")
+  #
+  # **A semantic model is tagged too, and it did not used to be** - it returned the plain
+  # list and let `task_of()`'s default speak for it, which made it indistinguishable from a
+  # bare model list and is half of `maju116/rplatypus#239`. The set rather than the one task
+  # is this constructor's answer, and the condition is the engine's own: since pyplatypus
+  # `0.8.0a28` a U-shaped model may leave `separation` out **beside `weights`**, because a
+  # published sidecar records what the channels were trained to predict. So a model with
+  # weights and no separation is admissible for either, and `admissible_tasks()` now reads
+  # that off the tag instead of recomputing it one layer away. `maju116/rplatypus#181` is
+  # where the condition came from.
+  if (!is.null(separation)) return(structure(built, task = "instance_segmentation"))
+  if (is.null(weights)) return(structure(built, task = "semantic_segmentation"))
+  structure(built, task = c("semantic_segmentation", "instance_segmentation"))
 }
 
 
@@ -217,7 +264,8 @@ u_net <- function(name, input_shape, channels = NULL, n_class = NULL,
                   metrics = NULL, optimizer = NULL, callbacks = NULL,
                   augmentation = NULL, epochs = NULL, batch_size = NULL,
                   splits = NULL, weights = NULL, fit = NULL,
-                  encoder = NULL, pretrained = NULL, freeze_encoder = NULL,
+                  encoder = NULL, pretrained = NULL, normalise = NULL,
+                  freeze_encoder = NULL,
                   encoder_learning_rate = NULL,
                   separation = NULL, decode = NULL) {
   segmentation_model(
@@ -249,6 +297,7 @@ u_net <- function(name, input_shape, channels = NULL, n_class = NULL,
     fit = fit,
     encoder = encoder,
     pretrained = pretrained,
+    normalise = normalise,
     freeze_encoder = freeze_encoder,
     encoder_learning_rate = encoder_learning_rate,
     separation = separation,
@@ -267,7 +316,8 @@ u_net_plus_plus <- function(name, input_shape, channels = NULL, n_class = NULL,
                             metrics = NULL, optimizer = NULL, callbacks = NULL,
                             augmentation = NULL, epochs = NULL, batch_size = NULL,
                             splits = NULL, weights = NULL, fit = NULL,
-                            encoder = NULL, pretrained = NULL, freeze_encoder = NULL,
+                            encoder = NULL, pretrained = NULL, normalise = NULL,
+                            freeze_encoder = NULL,
                             encoder_learning_rate = NULL,
                             separation = NULL, decode = NULL) {
   segmentation_model(
@@ -299,6 +349,7 @@ u_net_plus_plus <- function(name, input_shape, channels = NULL, n_class = NULL,
     fit = fit,
     encoder = encoder,
     pretrained = pretrained,
+    normalise = normalise,
     freeze_encoder = freeze_encoder,
     encoder_learning_rate = encoder_learning_rate,
     separation = separation,
@@ -317,7 +368,8 @@ res_u_net <- function(name, input_shape, channels = NULL, n_class = NULL,
                       metrics = NULL, optimizer = NULL, callbacks = NULL,
                       augmentation = NULL, epochs = NULL, batch_size = NULL,
                       splits = NULL, weights = NULL, fit = NULL,
-                      encoder = NULL, pretrained = NULL, freeze_encoder = NULL,
+                      encoder = NULL, pretrained = NULL, normalise = NULL,
+                      freeze_encoder = NULL,
                       encoder_learning_rate = NULL,
                       separation = NULL, decode = NULL) {
   segmentation_model(
@@ -349,6 +401,7 @@ res_u_net <- function(name, input_shape, channels = NULL, n_class = NULL,
     fit = fit,
     encoder = encoder,
     pretrained = pretrained,
+    normalise = normalise,
     freeze_encoder = freeze_encoder,
     encoder_learning_rate = encoder_learning_rate,
     separation = separation,
@@ -367,7 +420,8 @@ linknet <- function(name, input_shape, channels = NULL, n_class = NULL,
                     metrics = NULL, optimizer = NULL, callbacks = NULL,
                     augmentation = NULL, epochs = NULL, batch_size = NULL,
                     splits = NULL, weights = NULL, fit = NULL,
-                    encoder = NULL, pretrained = NULL, freeze_encoder = NULL,
+                    encoder = NULL, pretrained = NULL, normalise = NULL,
+                    freeze_encoder = NULL,
                     encoder_learning_rate = NULL,
                     separation = NULL, decode = NULL) {
   segmentation_model(
@@ -399,6 +453,7 @@ linknet <- function(name, input_shape, channels = NULL, n_class = NULL,
     fit = fit,
     encoder = encoder,
     pretrained = pretrained,
+    normalise = normalise,
     freeze_encoder = freeze_encoder,
     encoder_learning_rate = encoder_learning_rate,
     separation = separation,

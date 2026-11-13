@@ -53,6 +53,49 @@
 #'   straight to `train`.
 #' @param colormap A list of RGB triples, one per class, background first. For masks stored
 #'   as pictures. Give this or `labels`, not both.
+#' @param regions Overlapping classes, named as unions of a label-map value set: a list of
+#'   `list(name = , of = )`, where `of` holds the voxel values belonging to that region.
+#'   `list(list(name = "whole tumour", of = c(1, 2, 4)), list(name = "enhancing", of = 4))`
+#'   is the BraTS shape, and the second entry shows that a single value is ordinary rather
+#'   than an edge case. Give this, `colormap` or `labels`, not more than one.
+#'
+#'   **Two things this field changes that its name does not say.** There is **no background
+#'   entry**, so `n_class` here is not the same number it would be for that many `labels` -
+#'   with `labels` the background is a class and with `regions` it is not. And each channel
+#'   is an **independent binary question**, a sigmoid per channel rather than one softmax
+#'   across them, so a voxel may be in several regions at once - which is the whole point,
+#'   and the reason `save_masks()` cannot write such a prediction as one picture.
+#'
+#'   Two regions are the minimum: one region is ordinary binary segmentation, which
+#'   `labels = c(0, 1)` already says. Disjoint regions are allowed and mean something -
+#'   grouping several values into one class and dropping the background channel - so they
+#'   are not refused.
+#' @param classes_from For masks kept as **one binary file per class**: one pattern per
+#'   class, in class order. The fourth way of saying what a mask's classes are, and the only
+#'   one that can express an overlap that was drawn independently - a vessel crossing an
+#'   organ, or two annotators' masks of the same structure. Give this, `colormap`, `labels`
+#'   or `regions`, not more than one.
+#'
+#'   **It is `regions`' sibling, not its replacement**, and the difference is the file on
+#'   disk. `regions` derives overlapping channels from the values of one label map, which is
+#'   how BraTS stores its ground truth; this reads channels that were separate files to
+#'   begin with, because no single voxel value can hold two things drawn independently.
+#'   Everything the two share is everything after the target: no background entry, a sigmoid
+#'   per channel rather than one softmax across them, a voxel that may be in several classes
+#'   at once, and a prediction `save_masks()` cannot write as one picture - use
+#'   [save_class_masks()] or [save_class_volumes()].
+#'
+#'   Patterns are Python regular expressions matched against a sample's **mask** files, with
+#'   the same two rules `channels_from` has for images and for the same reason: each must
+#'   match exactly one file, and every mask file must be claimed by some pattern. Both halves
+#'   are refused, because each is invisible from the other side - a pattern matching nothing
+#'   is a class the model is never shown, and a file matching no pattern is a class the data
+#'   has and nobody asked for. R's own quoting applies:
+#'   `c("_vessel\\.png$", "_organ\\.png$")`.
+#'
+#'   The order is written rather than inferred, and here it matters more than for channels:
+#'   a model trained with the vessel in the first channel and used where the first channel
+#'   is the organ answers plausibly, in range, and nothing further down can notice.
 #' @param labels The voxel value of each class, in class order, for masks stored as label
 #'   maps - `c(0, 1)` for a binary segmentation, `c(0, 1, 2)` where 1 is liver and 2 is
 #'   tumour. This is how NIfTI and every other volume format label anything. Give this or
@@ -109,6 +152,7 @@
 #' @examples
 #' segmentation_data("train/", "valid/", colormap = binary_colormap)
 segmentation_data <- function(train, validation = NULL, colormap = NULL, labels = NULL,
+                              regions = NULL, classes_from = NULL,
                               test = NULL, split = NULL,
                               mode = c("nested_dirs", "config_file"),
                               window = NULL, dicom_window = NULL, target_spacing = NULL,
@@ -155,10 +199,32 @@ segmentation_data <- function(train, validation = NULL, colormap = NULL, labels 
 
   # Caught here rather than in the engine, because the message is the same and this way it
   # costs nothing: no interpreter starts to tell someone they gave both or neither.
-  if (is.null(colormap) == is.null(labels)) {
-    stop("give exactly one of `colormap` (masks stored as pictures) and `labels` ",
-         "(masks stored as label maps, which is how volumes do it).", call. = FALSE)
+  # Four ways to say what a mask's classes are, and exactly one of them. The engine says
+  # the same sentence - "Exactly one of `colormap`, `labels`, `regions` and `classes_from`
+  # is given" - and this says it before an interpreter starts, which is the only reason it
+  # is duplicated. It also names what was given: "exactly one" alone leaves the caller to
+  # work out which of their arguments the complaint is about.
+  #
+  # It was three until `0.8.0a28`, and the fourth is why this check exists in R at all: a
+  # bare `data` list or a YAML file through `platypus_spec()` reaches the engine's validator
+  # either way, so a constructor that accepted what the engine refuses - or refused what it
+  # accepts - would make the two R paths disagree. `rplatypus#180`.
+  chosen <- c(colormap = !is.null(colormap), labels = !is.null(labels),
+              regions = !is.null(regions), classes_from = !is.null(classes_from))
+  if (sum(chosen) != 1L) {
+    stop("give exactly one of `colormap` (masks stored as pictures), `labels` (masks ",
+         "stored as label maps, which is how volumes do it), `regions` (overlapping ",
+         "classes, named as unions of a label map's values) and `classes_from` (one ",
+         "binary mask file per class, for classes that overlap independently)",
+         if (any(chosen)) {
+           paste0(" - you gave ",
+                  paste(sprintf("`%s`", names(chosen)[chosen]), collapse = " and "))
+         } else {
+           " - you gave none"
+         },
+         ".", call. = FALSE)
   }
+  check_regions(regions)
   if (!is.null(window) && !is.null(dicom_window)) {
     stop("`dicom_window` is the former name of `window`; give one of them, not both.",
          call. = FALSE)
@@ -172,12 +238,25 @@ segmentation_data <- function(train, validation = NULL, colormap = NULL, labels 
     stop("`channels_from` patterns must be distinct - two channels matching the same file ",
          "would make one measurement into two.", call. = FALSE)
   }
+  # The same two refusals for the other pattern field, and the nouns are the difference.
+  # One pattern is not a list of classes to overlap: with a single class there is nothing
+  # for the second channel to be, and `labels = c(0, 1)` already says ordinary binary
+  # segmentation - which is the engine's own argument for `regions` needing two.
+  if (!is.null(classes_from) && length(classes_from) < 2L) {
+    stop("`classes_from` needs one pattern per class, so at least two. One binary mask is ",
+         "ordinary binary segmentation, which `labels = c(0, 1)` already says.",
+         call. = FALSE)
+  }
+  if (!is.null(classes_from) && anyDuplicated(classes_from)) {
+    stop("`classes_from` patterns must be distinct - two classes matching the same file ",
+         "would make one class into two.", call. = FALSE)
+  }
   if (!is.null(target_spacing) &&
         (length(target_spacing) != 3L || anyNA(target_spacing) || any(target_spacing <= 0))) {
     stop("`target_spacing` must be three positive numbers, in millimetres.", call. = FALSE)
   }
 
-  list(
+  built <- list(
     train_path = train,
     # FALSE is not a path. It travels as the engine's own `validation` flag, and
     # `validation_path` stays absent - sending both would be the contradiction the engine
@@ -194,8 +273,22 @@ segmentation_data <- function(train, validation = NULL, colormap = NULL, labels 
     # `config_file` on their behalf - R deciding is as good a reason as the user deciding,
     # and the engine cannot tell them apart anyway.
     mode = if (explicit_mode || !identical(mode, "nested_dirs")) mode else NULL,
-    colormap = if (is.null(colormap)) NULL else lapply(colormap, as.integer),
-    labels = if (is.null(labels)) NULL else as.integer(labels),
+    # Through `whole()` rather than `as.integer()`: a fractional value here was truncated
+    # in silence, and for a colormap that can land one class's colour on another's.
+    # `maju116/rplatypus#254`.
+    colormap = if (is.null(colormap)) NULL else lapply(
+      seq_along(colormap),
+      function(i) whole(colormap[[i]], paste0("colormap[[", i, "]]"))
+    ),
+    labels = whole(labels, "labels"),
+    # `as.list()` around each `of` rather than `as.integer()` alone, and the single-value
+    # case is why: reticulate turns a length-1 integer vector into a Python *scalar*, so
+    # `of = 4` would arrive as `4` where the schema wants `[4]` - and `of: [4]` is the
+    # ordinary case rather than an edge one, since BraTS's enhancing tumour is exactly
+    # that. Measured both ways before this was written.
+    regions = if (is.null(regions)) NULL else lapply(regions, function(region) {
+      list(name = as.character(region$name), of = as.list(as.integer(region$of)))
+    }),
     # Left out entirely when unset. An older engine rejects fields it does not know, so
     # sending a default nobody asked for would break every run that has nothing to do
     # with DICOM - and the version pin exists precisely to make such mismatches loud
@@ -206,10 +299,16 @@ segmentation_data <- function(train, validation = NULL, colormap = NULL, labels 
              else as.numeric(window),
     target_spacing = if (is.null(target_spacing)) NULL else as.numeric(target_spacing),
     channels_from = if (is.null(channels_from)) NULL else as.character(channels_from),
+    classes_from = if (is.null(classes_from)) NULL else as.character(classes_from),
     subdirs = if (gave$subdirs) subdirs else NULL,
     column_sep = if (gave$column_sep) column_sep else NULL,
     shuffle = if (gave$shuffle) shuffle else NULL
   )
+  # Tagged like every sibling constructor, and it did not used to be: `task_of()` answered
+  # "semantic_segmentation" for anything untagged, so this block and a bare `data` list were
+  # the same object to the inference. Naming the task here is what lets an absent tag mean
+  # *nothing was said* - `maju116/rplatypus#239`.
+  structure(built, task = "semantic_segmentation")
 }
 
 #' Colormaps and their labels
@@ -296,15 +395,27 @@ ct_windows <- function() {
 #' The engine validates it, so a mistake is caught here rather than part-way through a
 #' training run - and reported against the model that has it, by the name you gave it.
 #'
-#' @param data A [segmentation_data()], [detection_data()] or [instance_data()]
+#' @param data A [segmentation_data()], [detection_data()], [instance_data()] or
+#'   [classification_data()]
 #'   specification, or the path to a YAML file. Which one it is decides `task`.
+#'
+#'   **A plain list of the same fields also works**, which is what a caller assembling a
+#'   configuration programmatically reaches for, and it is the shape a YAML file already
+#'   proves the engine accepts. A plain list names no task, so `task` is then taken from
+#'   whatever else does - the models, if they were built by a constructor - and from the
+#'   `task` argument when nothing else says anything. With neither, it is semantic
+#'   segmentation. A constructor is still the better route: it refuses a wrong field here
+#'   rather than across the bridge, and the fields it refuses are most of what it is for.
 #' @param models A list of model specifications, see [models] and [available_models()].
 #'   More than one is the ordinary case rather than the exception: they are trained in turn
 #'   against the same data and the same split, which is what makes their numbers
 #'   comparable, and a comparison is written by listing several entries of the same
-#'   architecture with different settings.
+#'   architecture with different settings. For a classifier, which has no architecture to
+#'   vary, the comparison the task makes easiest is several entries differing only in
+#'   `encoder` - ours against a pretrained backbone, on the same split.
 #' @param task Which task this specification describes, one of `"semantic_segmentation"`,
-#'   `"object_detection"` or `"instance_segmentation"`. Normally left unset: the data and
+#'   `"object_detection"`, `"instance_segmentation"` or `"classification"`. Normally left
+#'   unset: the data and
 #'   model constructors already decide it, and `segmentation_data()` with `u_net()` can only
 #'   mean one thing. Given, it is **checked against them rather than trusted**, so it can
 #'   only agree or refuse.
@@ -407,7 +518,10 @@ print.platypus_spec <- function(x, ...) {
   cat("platypus specification\n")
   if (!is.null(x$source)) cat("  from        :", x$source, "\n")
   cat("  data        :", info$data$train_path, "\n")
-  cat("  classes     :", length(info$data$colormap), "\n")
+  # The engine's own count, not the colormap's length: `labels`, `regions` and
+  # `classes_from` leave `colormap` empty, so three of the four namings printed
+  # `classes : 0`. `maju116/rplatypus#256`.
+  cat("  classes     :", shim()$data_facts(x$py)$n_class, "\n")
   cat("  models      :", length(models), "\n")
   for (m in models) {
     shape <- paste(unlist(m$input_shape), collapse = "x")
@@ -472,8 +586,23 @@ compact <- function(x) {
 #' @noRd
 agreed_task <- function(data, models, stated = NULL) {
   from_data <- task_of(data)
-  from_models <- vapply(models, task_of, character(1))
-  all_tasks <- unique(c(from_data, from_models))
+  # Each model contributes the tasks it is *admissible* for rather than one it claims, and
+  # the answer is the intersection with the data's one task. An intersection rather than a
+  # fallback, because a fallback would swallow the case a wrong pairing is actually about:
+  # a `u_net()` beside `detection_data()` says nothing about detection and must still be
+  # refused, which "the data decides when the model is silent" would have accepted.
+  from_models <- lapply(models, admissible_tasks)
+
+  # Only the objects that actually said something, which is `maju116/rplatypus#239`. A bare
+  # `data` list - a plain list of fields rather than one of the four constructors - is a
+  # route `platypus_spec()` accepts and the engine validates, and until now it contributed
+  # "semantic_segmentation" to this intersection because that was `task_of()`'s default for
+  # anything untagged. So the bare path could express one task out of four: a stated
+  # `task = "classification"` was refused for disagreeing with an answer no constructor had
+  # given, and a `classifier()` beside a bare list was refused as *mixing* two tasks when
+  # only one of the two had been named at all. Nothing is inferred from silence now.
+  evidence <- Filter(Negate(is.null), c(list(from_data), from_models))
+  all_tasks <- if (length(evidence)) Reduce(intersect, evidence) else character(0)
 
   # `task` is derived rather than typed, because `segmentation_data()` with `u_net()` can
   # only mean one thing and saying it again could only ever disagree. It can still be
@@ -487,14 +616,27 @@ agreed_task <- function(data, models, stated = NULL) {
   # constructor does not - `separation` is required on an instance model and has no
   # counterpart on a semantic one - so a model still names its task and cannot leave it unsaid.
   #
+  # And the engine has since made that last clause narrower: `0.8.0a28` lets an instance
+  # model leave `separation` out *beside `weights`*, because a published file records what
+  # it was trained to predict. So a model no longer names one task - it names the tasks it
+  # is admissible for, and `admissible_tasks()` below is where that lives. Found by
+  # re-reading this field's prose when the field-prose ledger said the engine had rewritten
+  # it, which is the only thing that step is for. `maju116/rplatypus#181`.
+  #
   # So this argument keeps the job it has. Instances arrive as `instance_data()`, tagged the
   # way `detection_data()` tags itself, and what that constructor is for is the five fields it
   # refuses - `colormap`, `labels`, `regions`, `channels_from`, `target_spacing` - rather than
   # any it adds. `known` below gained "instance_segmentation" with that constructor and not
   # before, because a value nothing can produce would only ever reach the disagreement error.
+  #
+  # It gained "classification" the same way, with `classification_data()` and `classifier()`.
+  # That task breaks the pattern the paragraph above describes rather than extending it: a
+  # classifier has no `architecture` at all, so the *model* names its task outright instead
+  # of having it read off a field - there is nothing a semantic model could be mistaken for.
   if (!is.null(stated)) {
     stated <- as.character(stated)[[1L]]
-    known <- c("semantic_segmentation", "object_detection", "instance_segmentation")
+    known <- c("semantic_segmentation", "object_detection", "instance_segmentation",
+               "classification")
     if (!stated %in% known) {
       renamed <- c(segmentation = "semantic_segmentation", detection = "object_detection")
       if (stated %in% names(renamed)) {
@@ -511,22 +653,131 @@ agreed_task <- function(data, models, stated = NULL) {
            "task; stating it is a way of being explicit, not a way of changing it.",
            call. = FALSE)
     }
+    # Nothing named a task, so there is nothing for this to disagree with and it is taken
+    # rather than checked. The guard above is untouched: `segmentation_data()` with
+    # `u_net()` names semantic segmentation twice, so a stated `"object_detection"` beside
+    # them is still two intentions in one specification. The condition is the **absence of
+    # evidence**, not the presence of a `task` argument. The engine still validates what
+    # this builds, and its refusal names the field that is wrong rather than a task nobody
+    # chose.
+    if (!length(evidence)) return(stated)
+    # Several tasks are admissible and the caller picked one of them. Reachable only from
+    # the bare path, since every data constructor names exactly one task and the
+    # intersection with it can hold at most one.
+    if (stated %in% all_tasks) return(stated)
   }
 
   if (length(all_tasks) == 1L) return(all_tasks)
 
+  if (!length(evidence)) {
+    # A bare data list and bare models, with no `task`. Semantic segmentation is what this
+    # route has always built, so it keeps building it rather than becoming a refusal for
+    # callers who were relying on the old default.
+    return("semantic_segmentation")
+  }
+
+  if (length(all_tasks) > 1L) {
+    stop("this specification does not say which task it is. ", paste(all_tasks, collapse = " and "),
+         " are both admissible for the models given, and the data block says nothing - a bare ",
+         "`data` list names no task, where `segmentation_data()` and friends each name one. ",
+         "Give `task = ` or build the data block with a constructor.", call. = FALSE)
+  }
+
   named <- vapply(seq_along(models), function(i) {
     name <- models[[i]][["name"]]
     sprintf("%s is %s", if (is.null(name)) paste0("models[[", i, "]]") else name,
-            from_models[[i]])
+            if (is.null(from_models[[i]])) "a bare list and names no task"
+            else paste(from_models[[i]], collapse = " or "))
   }, character(1))
   stop("a specification describes one task, and this one mixes them: the data is ",
-       from_data, " while ", paste(named, collapse = ", "), ".\n",
+       if (is.null(from_data)) "a bare list and names no task" else from_data,
+       " while ", paste(named, collapse = ", "), ".\n",
        "  Masks and boxes are not the same pipeline, so there is nothing to reconcile - ",
        "use `segmentation_data()` with `u_net()` and friends, or `detection_data()` with ",
        "`yolo3()`.", call. = FALSE)
 }
 
+
+#' Which tasks a model could belong to, rather than the one it claims
+#'
+#' A data block names exactly one task. A model may name a set, as of pyplatypus
+#' `0.8.0a28`: a U-shaped model that named no `separation` is semantic **unless it names
+#' `weights`**, and then it may be either, because an instance model may now leave that
+#' field to the file - a published sidecar records what the channels were trained to
+#' predict, and `"dsbowl-instances"` is a rim of width 2, which is a training decision
+#' rather than a shape and nothing a reader can guess.
+#'
+#' **The condition is the engine's own rather than an invention here**, which is what keeps
+#' the two from drifting: the engine permits the omission exactly where `weights` is set,
+#' and refuses a file whose sidecar does not record the separation. So a model that forgot
+#' `separation` and names no weights is still read as semantic and still refused beside
+#' `instance_data()` as two tasks in one specification - which is the pair that would
+#' otherwise be silent, the same layout and the same architecture differing only in whether
+#' a signal is predicted at all, and there is a test holding that case where it was.
+#'
+#' **The condition now lives in the constructor and this reads the tag**, which is the
+#' half of `maju116/rplatypus#239` about models: computing it here meant a plain list with
+#' a `weights` element answered "semantic or instance" as confidently as a `u_net()` did,
+#' so a bare model list could not be told from a built one. One function, two lines, and
+#' `NULL` for an object that says nothing.
+#'
+#' `maju116/rplatypus#181`, found by re-reading this field's prose when the field-prose
+#' ledger reported the engine had rewritten its description.
+#'
+#' @noRd
+admissible_tasks <- function(model) {
+  attr(model, "task", exact = TRUE)
+}
+
+
+#' Is this a list of regions, and does it say enough to be one
+#'
+#' Checked here rather than left to the engine for the reason the exclusivity check is:
+#' the message is the same and this way no interpreter starts to deliver it. The counts
+#' and the wording follow the schema rather than an opinion - `minItems: 2` is the
+#' engine's, and so is the reason for it.
+#'
+#' @keywords internal
+#' @noRd
+check_regions <- function(regions) {
+  if (is.null(regions)) return(invisible(NULL))
+  if (!is.list(regions) || !length(regions)) {
+    stop("`regions` is a list of `list(name = , of = )`, one entry per class.",
+         call. = FALSE)
+  }
+  if (length(regions) < 2L) {
+    stop("`regions` needs at least two entries. One region is ordinary binary ",
+         "segmentation, which `labels = c(0, 1)` already says - and says with a ",
+         "background channel, which `regions` does not have.", call. = FALSE)
+  }
+  for (index in seq_along(regions)) {
+    region <- regions[[index]]
+    where <- sprintf("`regions[[%d]]`", index)
+    if (!is.list(region) || !all(c("name", "of") %in% names(region))) {
+      stop(where, " needs both `name` and `of`: `list(name = \"whole tumour\", ",
+           "of = c(1, 2, 4))`.", call. = FALSE)
+    }
+    if (!is.character(region$name) || length(region$name) != 1L ||
+          !nzchar(region$name)) {
+      stop(where, "$name is the channel's name and what a per-class score is reported ",
+           "under, so it is one non-empty string.", call. = FALSE)
+    }
+    of <- region$of
+    if (!is.numeric(of) || !length(of) || anyNA(of) || any(of != trunc(of))) {
+      stop(where, "$of is the label-map values belonging to '", region$name,
+           "' - at least one whole number. A single value is ordinary: BraTS's ",
+           "enhancing tumour is `of = 4`.", call. = FALSE)
+    }
+  }
+  names_given <- vapply(regions, function(region) region$name, character(1))
+  if (anyDuplicated(names_given)) {
+    duplicated_names <- unique(names_given[duplicated(names_given)])
+    stop("every region needs its own `name`, because the name is the output channel and ",
+         "what a per-class score is reported under; repeated: ",
+         paste(sprintf("'%s'", duplicated_names), collapse = ", "), ".", call. = FALSE)
+  }
+  invisible(NULL)
+}
 
 #' Exactly one way of getting a validation set, checked the same for both tasks
 #'
@@ -587,12 +838,34 @@ check_split <- function(validation, split, test) {
 #' @noRd
 split_block <- function(split) {
   if (is.null(split)) return(NULL)
-  structure(
-    c(list(fractions = as.numeric(split$fractions)),
-      list(group_by = split$group_by),
-      if (is.null(split$seed)) list() else list(seed = int1(split$seed))),
-    class = c("platypus_verbatim", "list")
+  if (!is.list(split)) {
+    stop("`split` is a list: `fractions`, and optionally `group_by` and `seed`.",
+         call. = FALSE)
+  }
+  # `[[` rather than `$`, because `$` on a list matches a name by PREFIX - so `seeds = 7`
+  # was read as `seed` and worked, which is the quietest way for a misspelling to survive.
+  # §4 of the workbench's notes records `cb$start` matching `start_epoch` for this reason.
+  known <- c("fractions", "group_by", "seed")
+  # Assembled with `c(list(...))` throughout and never with `block$key <- value`, because
+  # assigning NULL to a list element REMOVES it - which is the very thing the paragraph
+  # above exists to prevent, and which the first version of this fix did, taking
+  # `group_by = NULL` back out and making the engine refuse a key the caller wrote. Caught
+  # by the control beside the test rather than by reading it.
+  block <- c(
+    list(fractions = as.numeric(split[["fractions"]])),
+    list(group_by = split[["group_by"]]),
+    # `[[` rather than `$` here too, for the prefix reason above.
+    if (is.null(split[["seed"]])) list() else list(seed = int1(split[["seed"]]))
   )
+  # EVERYTHING ELSE IS FORWARDED rather than dropped. This rebuilt the block from the three
+  # names above and discarded the rest, so `split = list(fractions = ..., sed = 7)` was
+  # accepted by R and refused by name on the YAML route - one configuration, two answers.
+  # The engine's `SplitSpec` is `extra = "forbid"`, so forwarding is what makes R's refusal
+  # the engine's refusal rather than a second copy of its field list.
+  # `maju116/rplatypus#253`.
+  extra <- setdiff(names(split), known)
+  block <- c(block, split[extra])
+  structure(block, class = c("platypus_verbatim", "list"))
 }
 
 

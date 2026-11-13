@@ -6,7 +6,12 @@
 \alias{callback_model_checkpoint}
 \alias{callback_reduce_lr_on_plateau}
 \alias{callback_cosine_annealing}
+\alias{callback_linear_annealing}
+\alias{callback_step_decay}
 \alias{callback_csv_logger}
+\alias{callback_ema}
+\alias{callback_stop_after}
+\alias{callback_terminate_on_collapse}
 \alias{callback_terminate_on_nan}
 \title{Callbacks}
 \usage{
@@ -14,10 +19,17 @@ callback_early_stopping(
   monitor = "val_loss",
   patience = 10,
   min_delta = 0,
-  restore_best = TRUE
+  restore_best = TRUE,
+  start = NULL,
+  start_epoch = NULL
 )
 
-callback_model_checkpoint(path, monitor = "val_loss", save_best_only = TRUE)
+callback_model_checkpoint(
+  path,
+  monitor = "val_loss",
+  save_best_only = TRUE,
+  when = NULL
+)
 
 callback_reduce_lr_on_plateau(
   monitor = "val_loss",
@@ -28,33 +40,147 @@ callback_reduce_lr_on_plateau(
 
 callback_cosine_annealing(min_lr = 0, epochs = NULL)
 
+callback_linear_annealing(min_lr = 0, epochs = NULL)
+
+callback_step_decay(factor = 0.1, every = NULL, milestones = NULL, min_lr = 0)
+
 callback_csv_logger(path)
+
+callback_ema(decay = 0.999)
+
+callback_stop_after(hours)
+
+callback_terminate_on_collapse(
+  floor = 1e-04,
+  patience = 3,
+  monitor = "val_foreground"
+)
 
 callback_terminate_on_nan()
 }
 \arguments{
-\item{monitor}{What to watch: \code{"val_loss"}, \code{"train_loss"}, or \code{"val_"} followed by a
-metric name, such as \code{"val_dice"}.}
+\item{monitor}{What to watch: \code{"val_loss"}, \code{"train_loss"}, \code{"val_"} followed by a
+metric name such as \code{"val_dice"}, \code{"val_foreground"} and \code{"train_foreground"} - the
+share of the prediction that is not background - or \strong{\code{"val_dice_worst"} and its kind,
+the lowest any single case scored.}
 
-\item{patience}{Epochs to wait before acting.}
+That last one is the number \code{\link[=summary]{summary()}} on \code{\link[=evaluate_cases]{evaluate_cases()}} tells you to read, and
+until the engine's \verb{0.8.0a36} nothing could act on it: a model averaging 0.86 that
+scores 0.11 on some patient has a failure mode, and the mean is where it hides.
+Stopping, checkpointing and cutting the learning rate can all watch it now.
+
+Validation only. The training data is shuffled between epochs, so a case has no
+identity in that pass and there is nothing honest to pool by - \code{"train_dice_worst"}
+is refused rather than quietly reported as something else.}
+
+\item{patience}{Epochs to wait before acting. For
+\code{callback_terminate_on_collapse()} that is epochs in a row below the floor, and it is
+not 1 because an early epoch legitimately predicts almost nothing.}
 
 \item{min_delta}{Improvement smaller than this does not count.}
 
 \item{restore_best}{Put the best weights back when training stops, rather than keeping
 the last - which are by definition the ones that were not improving. On by default.
-Note that \code{callback_swa()} replaces nothing if a run stops before averaging began.}
+Note that \code{callback_swa()} replaces nothing if a run stops before averaging began.
 
-\item{path}{Where to write.}
+\strong{An averager beside this one wins.} \code{callback_ema()} and \code{callback_swa()} also
+replace the weights when training ends, and since engine \verb{0.8.0a57} the order is fixed
+rather than left to wherever the callbacks sat in the list: the average is what the run
+hands back, because somebody who configured averaging asked for the averaged model and
+this argument is a statement about which \emph{epoch} was best. Before that release the
+answer was whichever of the two this package happened to send last, and the run record
+reported the EMA steps either way. Re-read here because the engine rewrote its own
+sentence for this field, which is what the field-prose ledger is for.}
+
+\item{start, start_epoch}{When the callback may begin to act - \strong{one of the two and
+never both}. \code{start} is a fraction of the run (\code{0.1} leaves the first tenth alone)
+and \code{start_epoch} is an epoch number. Two arguments rather than one taking either,
+because a fraction survives a change to \code{epochs} and an epoch count does not, and in
+a YAML specification \code{1} and \code{1.0} are the same value once parsed - so one field
+would make "epoch one" and "the whole run" indistinguishable.
+
+For \code{callback_early_stopping()} this is a \strong{warm-up}: a model that needs fifteen
+epochs before its validation curve means anything would otherwise need
+\code{patience > 15} for the whole run, paying that slack at the end as well. It delays
+\strong{the stopping and nothing else} - an epoch inside the warm-up can still be the best
+one and \code{restore_best} still returns to it, because those are the best weights the run
+has if it ends for another reason.
+
+For \code{callback_swa()} it is the point averaging begins, which is the same concept and
+therefore the same two words.}
+
+\item{path}{Where to write. For \code{callback_model_checkpoint()} that is the weights file; for
+\code{callback_csv_logger()} it is one row per epoch appended as the epoch ends - the same
+numbers \code{\link[=training_history]{training_history()}} returns, so a run that is interrupted still leaves its
+history behind. Re-read against the engine's own text when it changed in \verb{0.8.0a23},
+which is what the field-prose ledger is for: the engine's sentence had named this
+package's \code{training_history()} to a Python reader, and the fix there left R's \verb{@param}
+saying three words about two different files.
+
+\strong{The checkpoint's extension decides its format}, since the engine's \verb{0.8.0a31}:
+\code{.safetensors} is written as safetensors and anything else as a torch archive, which
+is what \code{.pt} has always meant. Before that the file was a torch archive whatever it
+was called, so a checkpoint named after the files this package publishes was written
+in one format and read as another - and reading now goes by the file's contents rather
+than by its name, so a checkpoint written by an older engine still loads. A checkpoint
+is the run's safety net; \code{\link[=export_weights]{export_weights()}} is what writes a file for somebody else to
+load, with the sidecar that says what it is for.}
 
 \item{save_best_only}{Only write when the watched quantity improves, which is the
 default. \code{FALSE} writes every epoch, which is what to use when a run may be
 interrupted rather than when the best epoch is what you want to keep.}
 
-\item{factor, min_lr}{For the learning rate schedule. \code{min_lr} is the floor for both
-\code{callback_reduce_lr_on_plateau()} and \code{callback_cosine_annealing()}.}
+\item{when}{For \code{callback_model_checkpoint()}, a named list of thresholds that must
+\strong{all} hold before anything is written: \code{list(val_dice = 0.9, val_loss = 0.2)}.
+\strong{The direction is derived, not configured} - anything ending in \code{loss} has to be
+below its threshold and everything else above it, the same rule \code{monitor} uses - so
+there is no argument to get backwards. The names are checked against what the model
+reports when the specification is built, not at the first epoch.
 
-\item{epochs}{For \code{callback_cosine_annealing()}, how many epochs to spread the decay
-over. Unset means the model's \code{epochs}.}
+It is an \strong{extra gate beside \code{save_best_only}}, not a replacement: with both, a file
+is written when the watched number improves \emph{and} every threshold holds. A threshold
+is a number about your data and does not transfer between datasets, and a run whose
+conditions never hold writes nothing and says so when it ends.}
+
+\item{factor, min_lr}{What the rate is multiplied by, and the floor it does not go below.
+\code{factor} is the cut on a plateau for \code{callback_reduce_lr_on_plateau()} and the drop
+at each step for \code{callback_step_decay()}, where it must be below 1 - a step schedule
+that raises the rate is a different idea and accepting it here would hide a typo.
+\code{min_lr} is the floor for all four, and \strong{two of the four reach it and two do not}:
+a plateau cut and a step drop land on it and stay, while the two annealers approach it
+and write it only after the last epoch unless \code{epochs} is set shorter than the run.
+See the cosine section.}
+
+\item{epochs}{For \code{callback_cosine_annealing()} and \code{callback_linear_annealing()}, how
+many epochs to spread the decay over. Unset means the model's \code{epochs}, which is what
+you want: a curve that ends where the run ends.}
+
+\item{every, milestones}{For \code{callback_step_decay()}, \strong{one of the two and never both}.
+\code{every = 30} drops every thirty epochs; \code{milestones = c(30, 60)} drops at those
+epochs, 1-based and strictly increasing, which is how a published recipe states it.
+Two arguments rather than one that takes either, because \code{30} and \code{c(30)} are
+different schedules and a single argument holding either would be read as whichever
+was typed. A period survives a change to \code{epochs}; a list of milestones does not.}
+
+\item{decay}{For \code{callback_ema()}, how much of the average survives each optimiser
+\strong{step} - not each epoch. 0.999 is the usual value and gives a half-life of about
+700 steps; it is the published number because the average is fed per step, which is
+what the engine's fourth callback hook was added for. Unlike \code{\link[=callback_swa]{callback_swa()}} this
+needs no pass over the training data at the end: the batch-normalisation statistics
+are averaged alongside the weights rather than recomputed.}
+
+\item{hours}{For \code{callback_stop_after()}, a wall-clock budget. An epoch cap cannot
+express it, because how long an epoch takes is a property of the data and the shape.
+Checked at the end of an epoch, so the real limit is this plus one epoch; the run's
+stop reason names the clock, so a run that ran out of time does not read as one that
+converged.}
+
+\item{floor}{For \code{callback_terminate_on_collapse()}, the share of foreground below
+which a prediction counts as collapsed. A floor rather than a test for zero, because
+0.01\% foreground against a target that is 14\% foreground has collapsed in every sense
+that matters. The default sits far below any real target on purpose: this guards
+against a failure, not against a model being merely bad, and a floor near a real
+foreground share would end runs that were only disappointing.}
 }
 \value{
 A callback specification.
@@ -67,18 +193,80 @@ when the specification is built rather than waited on forever.
 \details{
 Whether the watched quantity should rise or fall is worked out from its name: anything
 ending in \code{loss} is minimised, everything else maximised.
+}
+\section{The one number that is not about quality}{
 
-There is a seventh, documented separately because it needs a page of its own:
+
+Every epoch reports \code{foreground} as well - for both passes, \code{train_foreground} and
+\code{val_foreground} - which is the share of the prediction that is \strong{not background}.
+Nothing is compared against the truth, so it is not a measure of how good the model is;
+it answers whether the model is still producing a segmentation at all.
+
+It is reported whether or not you ask for it, and that is the point. A model that
+collapses to predicting background everywhere is invisible in the numbers it already
+produced: with \code{include_background = TRUE} the Dice is a mean over class channels and
+the background channel is nearly perfect, so a collapsed model reports around 0.5 while
+its loss falls contentedly. A collapse you have to opt into noticing is one you will not
+notice.
+
+\code{callback_terminate_on_collapse()} acts on it, \code{evaluate()} carries it as a column, and
+\code{callback_model_checkpoint()}'s \code{when} can take a condition on it.
+
+There is a twelfth, documented separately because it needs a page of its own:
 \code{\link[=callback_swa]{callback_swa()}} averages the weights over the last part of the run. It watches
 nothing and changes how reproducible a run is rather than how well it scores.
 }
+
+\section{One averager per run}{
+
+
+\code{\link[=callback_swa]{callback_swa()}} and \code{callback_ema()} both replace the model's weights when training
+ends, so a run takes \strong{one of them}; the engine refuses both. They answer the same
+observation - the last epoch's corner is not the middle of the basin - with different
+weightings. \code{swa} folds the tail uniformly from a declared start; \code{ema} weights recent
+steps more and needs no start, because an average with a decay forgets the beginning by
+itself.
+
+\code{ema} is updated \strong{after every optimiser step}, which is what makes its decay mean what
+the literature means by it: 0.999 is 0.999 per step, so over 60 epochs of 200 batches
+that is 12,000 updates and a half-life of roughly 700 steps. A run with few steps wants
+a smaller number, because an average that forgets more slowly than the run is long never
+leaves where it started.
+}
+
+\section{One hand on the learning rate}{
+
+
+Three of these compute the rate from the epoch rather than from how the run is going -
+\code{callback_cosine_annealing()}, \code{callback_linear_annealing()} and
+\code{callback_step_decay()} - and \strong{at most one of them may be used}, because each
+recomputes the rate every epoch and two of them would simply overwrite each other.
+
+For the same reason a schedule and \code{callback_reduce_lr_on_plateau()} \strong{cannot be
+combined}, and the engine refuses the pair. That refusal replaced a sentence claiming
+the opposite: a schedule recomputes the rate from the optimiser's initial value at the
+end of every epoch, so it erases whatever the plateau callback cut. Measured on six
+epochs of a loss that never improves, the rate with both configured follows the cosine
+exactly - 0.0976, 0.0905, 0.0794 from 0.1 - where the plateau alone reaches 1e-6.
+
+A schedule beside \code{\link[=callback_swa]{callback_swa()}} is fine and the order is no longer luck: \code{swa} pins
+its constant rate after averaging begins, whatever position the callbacks sit in.
+}
+
 \section{Cosine annealing}{
 
 
-\code{callback_cosine_annealing()} decays the learning rate from its initial value to \code{min_lr}
-along a cosine. It watches nothing: it is a function of how far through the run you are
-rather than of how the run is going, which is the difference from
+\code{callback_cosine_annealing()} decays the learning rate from its initial value \strong{towards}
+\code{min_lr} along a cosine. It watches nothing: it is a function of how far through the run
+you are rather than of how the run is going, which is the difference from
 \code{callback_reduce_lr_on_plateau()} - and a run may legitimately want both.
+
+\strong{Towards rather than to}, which is the engine's \verb{0.8.0a69} and worth a sentence because
+the obvious reading is wrong: a scheduler steps after each epoch, so the value computed
+for the epoch \emph{after} the last one is \code{min_lr} and no epoch ever trains at it. The last
+epoch trains one step above. That is torch's own behaviour for the same schedule, and
+setting \code{epochs} shorter than the run is the only way a run trains at \code{min_lr} at all -
+the rate parks there for the remaining epochs.
 
 Each parameter group decays from its \strong{own} initial rate, so an \code{encoder_learning_rate}
 set on a model is not flattened at the first epoch. That would have been invisible: the

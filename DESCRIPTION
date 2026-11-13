@@ -1,7 +1,7 @@
 Package: rplatypus
 Type: Package
 Title: Computer Vision for Medical Imaging
-Version: 0.2.1
+Version: 0.3.1
 Authors@R: person("Michal", "Maj", email = "michalmaj116@gmail.com",
                   role = c("aut", "cre"))
 Description: Semantic segmentation and object detection for medical images, from a
@@ -14,7 +14,7 @@ License: MIT + file LICENSE
 URL: https://github.com/maju116/rplatypus,
         https://maju116.github.io/rplatypus/
 BugReports: https://github.com/maju116/rplatypus/issues
-SystemRequirements: Python (>= 3.10). Not a prerequisite the user
+SystemRequirements: Python (>= 3.11). Not a prerequisite the user
         installs: the package declares what it needs through
         'reticulate' and 'uv' provisions an isolated environment on
         first use, leaving any system Python untouched.
@@ -22,14 +22,14 @@ Encoding: UTF-8
 Depends: R (>= 4.1)
 Imports: ggplot2, grDevices, parallel, rlang, reticulate (>= 1.41),
         tools, utils
-Suggests: callr, jsonlite, knitr, pkgload, png, RNifti, rmarkdown,
-        testthat (>= 3.0.0), withr, yaml
+Suggests: callr, codetools, jsonlite, knitr, pkgload, png, RNifti,
+        rmarkdown, testthat (>= 3.0.0), withr, yaml
 Config/testthat/edition: 3
 VignetteBuilder: knitr
 Config/roxygen2/version: 8.1.0
 NeedsCompilation: no
-Packaged: 2026-10-22 17:27:58 UTC; maju116
+Packaged: 2026-11-13 20:10:08 UTC; maju116
 Author: Michal Maj [aut, cre]
 Maintainer: Michal Maj <michalmaj116@gmail.com>
 Repository: CRAN
-Date/Publication: 2026-11-04 22:00:02 UTC
+Date/Publication: 2026-11-13 21:20:02 UTC

@@ -8,6 +8,8 @@
 \alias{available_optimizers}
 \alias{available_callbacks}
 \alias{available_tasks}
+\alias{available_separations}
+\alias{available_decodings}
 \title{What this package can do, asked of the package}
 \usage{
 available_losses(task = "semantic_segmentation")
@@ -21,21 +23,34 @@ available_optimizers()
 available_callbacks()
 
 available_tasks()
+
+available_separations()
+
+available_decodings()
 }
 \arguments{
-\item{task}{\code{"semantic_segmentation"}, \code{"instance_segmentation"} or
-\code{"object_detection"}. Which components a specification may name depends on what it is
+\item{task}{\code{"semantic_segmentation"}, \code{"instance_segmentation"}, \code{"object_detection"}
+or \code{"classification"}. Which components a specification may name depends on what it is
 asking for, and for losses it genuinely differs: the three regression losses are listed
-only at the instance task, which is the only one with a target for them. No count is
+only at the instance task, which is the only one with a target for them, and
+classification lists two of the eleven - the ones that score each answer on its own
+rather than scoring an overlap. No count is
 written here on purpose - the counts are asserted in the test suite against the pinned
 engine, which is where a number nobody can re-measure from a help page belongs. This
-parameter listed two tasks until the pin moved to \verb{0.8.0a22}; the third arrived in the
-engine's \verb{0.8.0a20}.}
+parameter listed two tasks until the pin moved to \verb{0.8.0a22}, three until it moved to
+\verb{0.8.0a49}; the third arrived in the engine's \verb{0.8.0a20} and the fourth in \verb{0.8.0a49}.}
 }
 \value{
 A data frame with \code{name}, \code{arguments} and \code{description}. \code{arguments} is a single
 string per row, comma-separated, because a column of vectors prints as something nobody
 can read; \code{strsplit(x, ", ")} takes it apart.
+
+Two listings carry one column more, and it is the column they are asked for:
+\code{available_decodings()} has \code{needs}, the separation a decoding requires - empty where it
+requires none, which is \code{connected_components} and is why that one is always available -
+and \code{available_separations()} has \code{head_channels}, how wide a head that target makes.
+Taken from the engine's own rows rather than named on this side, so a listing that grows
+a field arrives here without R changing.
 }
 \description{
 Six listings beside \code{\link[=available_transforms]{available_transforms()}} and \code{\link[=available_weights]{available_weights()}}: the losses, the
@@ -63,6 +78,13 @@ than going into the specification.
 So \code{available_losses("object_detection")} and \code{available_metrics("object_detection")} raise
 a condition whose message says that, rather than returning a table with no rows. An empty
 table reads as "there are none", which is a different and wrong answer.
+
+\strong{\code{available_models("classification")} raises for the same kind of reason and a different
+fact.} A classifier chooses no architecture: the network is a contracting path, pooled,
+with one dense layer on top, and \code{encoder} decides whose contracting path it is - ours
+when it is unset, any of timm's when it names a backbone. So there is no \code{architecture}
+field to write and a row here would invite one. \link{encoders} is the listing that question
+actually has.
 }
 
 \examples{
@@ -80,11 +102,16 @@ available_metrics()[, c("name", "arguments")]
 # The entry point, for somebody who has read nothing yet.
 available_tasks()
 
+# The two instance axes: what a model can predict, and how those channels become objects.
+available_separations()[, c("name", "head_channels")]
+available_decodings()[, c("name", "needs")]
+
 # Detection says what it has instead of a loss to choose.
 try(available_losses("object_detection"))
 }
 }
 \seealso{
-\code{\link[=available_transforms]{available_transforms()}} and \code{\link[=available_weights]{available_weights()}}, the two that came first, and
-\code{\link[=platypus_spec]{platypus_spec()}}, where these names are written.
+\code{\link[=available_transforms]{available_transforms()}} and \code{\link[=available_weights]{available_weights()}}, the two that came first,
+\link{separations} and \link{decodings} for the constructors these two listings name, and
+\code{\link[=platypus_spec]{platypus_spec()}}, where all of them are written.
 }

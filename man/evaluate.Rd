@@ -7,14 +7,21 @@
 \usage{
 evaluate(object, ...)
 
-\method{evaluate}{platypus_fit}(object, split = "validation", ...)
+\method{evaluate}{platypus_fit}(object, split = "validation", at = NULL, ...)
 }
 \arguments{
 \item{object}{A \code{\link[=platypus_fit]{platypus_fit()}}.}
 
-\item{...}{Unused.}
+\item{...}{Must be empty; a misspelt argument is refused rather than ignored,
+which is what it used to be. \code{maju116/rplatypus#315}.}
 
 \item{split}{Which data to score on: \code{"validation"}, \code{"train"} or \code{"test"}.}
+
+\item{at}{Which grid to score on. \code{"model"} is each model's own \code{load_shape}, and
+leaving this unset is that. \code{"source"} puts every prediction back on the grid of the
+file it came from and scores it against the truth as stored, which is the form in
+which rows from models of different shapes answer one question. Segmentation only: a
+detection table has no grid to choose and says so rather than ignoring the argument.}
 }
 \value{
 A data frame, one row per model.
@@ -25,9 +32,48 @@ One row per model: what it is, how big it is, how long it trained, and how it sc
 \details{
 The \code{loss} column is only comparable between models trained on the same loss, which is
 why \code{loss_function} is there beside it. A Focal-Tversky of 0.05 is not better than a
-CCE-Dice of 0.14; it is not even the same question. Metrics stay comparable, because
-they measure the mask rather than the objective.
+CCE-Dice of 0.14; it is not even the same question.
+
+The metrics have a condition of their own and \code{load_shape} is it. Each model is scored on
+the grid it reads at, so a model at \code{input_shape = c(512, 512)} is measured against a
+truth reduced to 512 while one that tiles 2048 is measured against the truth as stored.
+Both numbers are a real Dice of a real prediction against a real mask, and they are not
+answers to the same question: measured on retinal vessels, that difference reported a
+resized model as \strong{+0.0187 better} where the honest figure was \strong{+0.0033}, and the bias
+runs the other way on clDice because upsampling smooths a prediction. When the rows
+disagree about the grid this warns, once; the column is there either way, because a table
+outlives the session that printed it.
+
+\code{at = "source"} is the answer to that warning rather than a workaround for it: every
+prediction goes back onto the grid of the file it came from and is scored against the
+truth as stored, so the rows answer one question and \code{load_shape} reads \code{source}. The
+grid is the files' own and you cannot name another, which is deliberate - a grid you
+name resamples the \strong{truth}, so the thing both models are judged against would itself
+become an interpolation somebody chose. Here only predictions move, and what that costs
+is in \code{predict()}: interpolation softens a boundary, and where reading cropped anatomy
+away the mask comes back padded with background, which means \emph{not examined}. For a
+comparison that is correct rather than unfair - a model whose field of view missed the
+organ did not segment it - but a 0 arriving that way is a result and not a fault. The
+loss is not reported there: a loss belongs to the objective a model trained with, on the
+grid it trained on.
 }
+\section{What the one row pools}{
+
+
+The \strong{mean over cases}, since the engine's \verb{0.8.0a40}. A case's own score is a ratio of
+sums - where a case arrived in tiles their overlap counts are added and the formula applied
+once, which is reassembly rather than a choice of average - and the split's figure is the
+mean of those. So this row is exactly \code{mean(evaluate_cases(fit)$dice)}, which is what
+anybody comparing the two expected and did not previously get: the engine divided an
+epoch's totals by the number of batches, so a short last batch weighed more than the
+others and the figure moved with \code{batch_size}. On a tiled run the difference was larger
+still, because tiles were averaged rather than reassembled - worth +0.033 to +0.049 of Dice
+on the retinal-vessel runs.
+
+\code{\link[=evaluate_cases]{evaluate_cases()}} pools a \strong{group} differently again, by adding the counts of the images
+in it, which is the better statistic for a patient rather than a slice. \code{maju116/rplatypus#196}.
+}
+
 \section{A note on the name}{
 
 \code{evaluate} is also exported by the \strong{evaluate} package, which knitr depends on, so the
@@ -42,6 +88,9 @@ tidymodels packages and a plain \code{fit} would have been theirs to own.
 \dontrun{
 evaluate(fit)                      # one row per model, on the validation split
 evaluate(fit, split = "test")
+
+# Two models of different shapes compared on one grid - the files' own.
+evaluate(fit, at = "source")
 
 # A split with no masks is refused by name rather than scored against nothing;
 # `predict()` still works on it.

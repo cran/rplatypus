@@ -7,6 +7,23 @@ vignette: >
   %\VignetteEncoding{UTF-8}
 ---
 
+<!--
+THIS PROSE HAS A COUNTERPART, AND THIS FILE IS THE SOURCE.
+
+The engine mirrors it as pyplatypus's `guide.qmd`. It exists as `guide.qmd`.
+
+By maju116/rplatypus#117 the vignette is the source and the article is the copy, so an edit
+here is an edit there, and an edit there alone is a mistake nothing will catch. What is held
+by a test is the walk: the `##` headings and their order, asserted from both sides -
+`tests/testthat/test-article-pairs.R` here and `tests/test_articles.py` in the engine. The
+route is deliberately not held, because the engine reaches each destination through a
+configuration file where this package reaches it through constructors.
+
+So: renaming or reordering a `##` heading in this file breaks both suites until the article
+follows. Changing the body of a section breaks neither, and that is the part no test can
+check - a heading test does not stop prose drifting.
+-->
+
 ```{r setup, include = FALSE}
 knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE, error = FALSE)
 ```
@@ -192,6 +209,121 @@ shorter, because support for volumes is uneven. Each step is probed at the model
 size while the pipeline is built, so a transform that cannot do the job says so before the
 first epoch rather than during it.
 
+## Overlapping classes instead of one per voxel
+
+`colormap` and `labels` both say the same thing about a voxel: it is in exactly one class.
+`regions` is the third way of naming classes and the only one that drops that assumption -
+classes named as unions of a label map's values, which is how BraTS and the
+lesion-inside-an-organ family actually store their ground truth.
+
+```yaml
+task: semantic_segmentation
+data:
+  train_path: data/train
+  validation_path: data/validation
+  regions:
+    - {name: whole tumour, of: [1, 2, 4]}
+    - {name: tumour core, of: [1, 4]}
+    - {name: enhancing, of: [4]}
+models:
+  - name: brats
+    input_shape: [240, 240]
+    loss: {name: focal}
+```
+
+The same from R. A region is a `list(name = , of = )`, and `of` takes the label-map values
+that belong to it:
+
+```{r}
+spec <- platypus_spec(
+  data = segmentation_data(
+    "data/train", "data/validation",
+    regions = list(
+      list(name = "whole tumour", of = c(1, 2, 4)),
+      list(name = "tumour core", of = c(1, 4)),
+      list(name = "enhancing", of = 4)
+    )
+  ),
+  models = list(u_net("brats", input_shape = c(240, 240), loss = loss_focal()))
+)
+```
+
+The last region shows that a single value is **ordinary** rather than an edge case: BraTS's
+enhancing tumour is one label.
+
+The task is still `semantic_segmentation`. What changes is what a channel means.
+
+**There is no background entry, so the class count is not the one you would write as
+`labels`.** Those same masks as `labels = c(0, 1, 2, 4)` are **four** classes; as the three
+regions above they are **three** channels. And a voxel whose value is `4` is in all three of
+them at once, which is the point rather than a tolerated side effect.
+
+**Each channel is an independent binary question** - a sigmoid per channel rather than one
+softmax across them - so the channels do not compete and do not sum to one. That is what
+makes the overlap expressible, and it is also why a prediction cannot be written back as a
+single picture with `save_masks()`: one voxel gets one colour, and a voxel here may belong to
+three classes.
+
+So `save_masks()` refuses such a prediction rather than taking the strongest channel, and
+`predict()` refuses `type = "class"` for the same reason - there is no one class per voxel to
+return. Ask for `type = "probability"` and write it with `save_class_masks()`, which gives one
+binary file per region, named after the region. The channel order is the order the regions
+were written in, which is also the order `inspect_masks()` names them in and the order every
+per-class score is reported in.
+
+**Two regions are the minimum**, because one region is ordinary binary segmentation and
+`labels = c(0, 1)` already says that - with a background channel, which `regions` has none
+of. Disjoint regions are allowed and are not a mistake: they group several values into one
+class and drop the background channel, which is a useful thing to ask for and is refused
+nowhere.
+
+**The failure this invites is quiet, so it is refused loudly.** A region whose `of` matches
+nothing in the data - `of = 3` against a label map holding `1`, `2` and `4` - is a channel of
+zeros. It trains to predict nothing and scores a Dice of 0 for that region while every other
+number in the run looks ordinary, which is the kind of result that gets read as "that class
+is hard". `platypus_fit()` refuses it before training, and `inspect_masks()` asks the same
+question over as much of the data as you want - **naming the region rather than giving its
+position**, because `missing_classes: 1` would leave you counting entries in the file above:
+
+```{r}
+inspect_masks(spec)
+#>   split unmatched samples_checked total_samples present_classes      missing_classes
+#> 1 train    0.0000             500          1251 whole tumour, ...    enhancing
+```
+
+### When the overlap was drawn separately: `classes_from`
+
+`regions` needs the overlap to be a union of one label map's values, which is how BraTS
+stores it: one integer per voxel, and the scored classes are conventions over those
+integers. Some overlaps are not like that. A vessel crossing an organ, or two annotators'
+masks of the same structure, were drawn independently, and no single integer can hold both.
+Those arrive as **one binary file per class**, and `classes_from` names them - one pattern
+per class, in class order, matched against a sample's mask files.
+
+```{r}
+spec <- platypus_spec(
+  data = segmentation_data(
+    "data/train", "data/validation",
+    classes_from = c("_vessel\\.png$", "_organ\\.png$")
+  ),
+  models = list(u_net("crossing", input_shape = c(256, 256)))
+)
+```
+
+Everything above still holds: independent binary questions, no background entry, a
+prediction `save_masks()` refuses and `save_class_masks()` writes. The difference between
+the two namings is the file on disk and nothing else.
+
+**Every pattern must match exactly one of a sample's mask files, and every mask file must
+match a pattern.** Both halves are refused, because each is invisible from the other side: a
+pattern matching nothing is a class the model is never shown, and a file matching no pattern
+is a class the data has and nobody asked for. Patterns are Python regular expressions, like
+`channels_from` and `group_by`, so R's own backslashes double.
+
+The order is written rather than inferred, and here it matters more than for channels: a
+model trained with the vessel in the first channel and used where the first channel is the
+organ answers plausibly, in range, and nothing further down can notice.
+
 ## Instances instead of one mask
 
 `task: instance_segmentation` keeps the objects apart rather than uniting them. The data
@@ -308,6 +440,210 @@ models:
 nine on blood cells - measured, 0.65 against 0.88 - so the default is the useful one and
 naming anchors by hand is for reproducing a published model. `detection_anchors()` reports
 them and `plot_anchors()` draws them against the boxes they were fitted to.
+
+## One label instead of a mask
+
+`task: classification` answers with one label for a whole image rather than one per voxel.
+The data block loses everything that describes a mask and gains the one thing a label
+needs - `classes`, in class order:
+
+```yaml
+task: classification
+data:
+  train_path: data/train
+  validation_path: data/validation
+  mode: nested_dirs
+  classes: [benign, malignant]
+models:
+  - name: ours
+    input_shape: [128, 128]
+    blocks: 4
+    filters: 16
+    loss: {name: cce}
+    metrics: [{name: auc}, {name: balanced_accuracy}]
+  - name: resnet
+    input_shape: [224, 224]
+    encoder: resnet34
+    pretrained: true
+    freeze_encoder: 2
+    pooling: max
+    head_dropout: 0.2
+    loss: {name: focal, gamma: 2}
+```
+
+The same thing from code is `classification_data()` and `classifier()`:
+
+```{r}
+spec <- platypus_spec(
+  data = classification_data("data/train", "data/validation",
+                             classes = c("benign", "malignant")),
+  models = list(
+    classifier("ours", input_shape = c(128, 128), blocks = 4, filters = 16,
+               loss = loss_cce(),
+               metrics = list(metric_auc(), metric_balanced_accuracy())),
+    classifier("resnet", input_shape = c(224, 224), encoder = "resnet34",
+               pretrained = TRUE, freeze_encoder = 2, pooling = "max",
+               head_dropout = 0.2, loss = loss_focal(gamma = 2))
+  )
+)
+```
+
+**Where the labelling is written follows from `mode` rather than being said twice.** In
+`nested_dirs` the directories under `train_path` are the classes, with the images inside
+them - the layout nearly every image dataset ships in - and in `config_file` the CSV's
+`label` column holds the name. `subdirs` is refused here, which is what keeps the two
+readings of `nested_dirs` apart: a sample is one image rather than a directory with the
+image in one subdirectory and what labels it in the other.
+
+**`classifier()` is the one model constructor in this package not named after an
+architecture**, and the missing field is the point rather than an omission. The network is a
+contracting path, pooled, with one dense layer on top, so `encoder` is the whole answer:
+unset it is ours, sized by `blocks` and `filters`, and named it is any of
+`available_encoders()`. The two models above are the comparison this task makes easiest -
+ours against a pretrained backbone on the same split. `blocks`, `filters` and `block_width`
+are **refused** beside `encoder` rather than ignored, because a backbone's own depth is then
+the only one there is, and `available_models("classification")` says all of this instead of
+returning rows.
+
+**`metric_auc()` is the default and that is a measurement rather than a preference.** On
+40000 images at a prevalence of 3%, with the model's own probabilities as the truth so that
+only its discrimination varies, accuracy spans 0.0100 where the AUC spans 0.4631 - and
+accuracy is not monotone in quality: the model with no signal at all scores above two that
+have one. `metric_balanced_accuracy()` and `metric_f1()` do not rescue it, moving 0.0000 and
+-0.0005 between a real signal and a collapse, because a calibrated model at that prevalence
+never crosses the threshold and everything read off the hard prediction sees the same
+all-negative answer. `class_balance()` is what makes that prevalence visible before a run
+rather than after it.
+
+**A split cut out of the training folder is stratified**, which is the one part of the walk
+this task overrides. Measured over 400 seeds, a random 70/15/15 of 100 images at a 3%
+prevalence leaves some part with none of the rare class 91% of the time, 64% at 200 images
+and 20% at 500 - and a per-class metric cannot average over a class its pass never held, so
+the run dies at the end of the first epoch with the epoch already paid for. `group_by`
+beside it is refused when a group's images do not share a label, because keeping a patient
+on one side and keeping a class on both are then two instructions that cannot both be
+followed.
+
+**What `predict()` gives back is a table rather than an array**, which is the shape the rest
+of R wants. `type = "class"` is one row per image with `key`, `label`, `predicted` and
+`probability`, and `type = "probability"` is a matrix of images by classes with the keys as
+row names - so either one joins to whatever else you hold per image. `space` and the
+`cases`/`each` pair are refused by name: they describe a grid, and a split of masks too
+large to hold at once, and neither is a thing one label per image has.
+`evaluate_cases()` is refused for a different reason - a case here is one image whose score
+is 0 or 1, so a split's worst case is 0 for any model that gets a single image wrong.
+
+### When the label is a set: `labels_from`
+
+A chest film with four findings is **four independent questions** rather than one of four
+alternatives, and `labels_from` is how that is said: one CSV column per class, in class
+order, each cell `0` or `1`.
+
+```yaml
+task: classification
+data:
+  train_path: data/train.csv
+  validation_path: data/validation.csv
+  mode: config_file
+  classes: [atelectasis, effusion, nodule, mass]
+  labels_from: [Atelectasis, Effusion, Nodule, Mass]
+models:
+  - name: ours
+    input_shape: [224, 224]
+    blocks: 4
+    filters: 16
+    loss: {name: cce}
+    metrics: [{name: auc}, {name: f1}]
+```
+
+The same thing from code:
+
+```{r}
+spec <- platypus_spec(
+  data = classification_data(
+    "data/train.csv", "data/validation.csv",
+    classes = c("atelectasis", "effusion", "nodule", "mass"),
+    labels_from = c("Atelectasis", "Effusion", "Nodule", "Mass"),
+    mode = "config_file"
+  ),
+  models = list(
+    classifier("ours", input_shape = c(224, 224), blocks = 4, filters = 16,
+               loss = loss_cce(), metrics = list(metric_auc(), metric_f1()))
+  )
+)
+```
+
+**It is a naming rather than a switch**, for the reason `regions` and `classes_from` are on
+the mask side: the *target* changes and not only the activation. A `label` column
+structurally cannot say a film has two findings, so a `multilabel = TRUE` would have trained
+sigmoid channels against an exclusive target, raised nothing, and reported plausible numbers
+meaning exactly what softmax meant.
+
+**Position is the pairing.** The headers may be called whatever the dataset calls them -
+above they are capitalised and the classes are not - and the model still learns the classes
+in the order `classes` names them. `config_file` only, because an image cannot sit in two
+directories without being two files, and `strict_labels` is refused beside it rather than
+ignored: the columns *are* the classes, so no cell can hold a class nobody named.
+
+A cell that is not `0`, `1`, `0.0` or `1.0` is refused by name, and the case it is written
+for is `-1`. The datasets shaped this way write `-1` for *uncertain* and leave the cell empty
+for *not mentioned*; both have a defensible mapping, which is exactly why the reader must not
+pick one for you. An image with none of the findings is an ordinary labelled row, written as
+a line of zeros.
+
+**`metric_accuracy()` is refused here rather than redefined.** On 4000 images with findings
+at 10%, 5%, 3% and 2%, a model answering no to everything scores **0.8137** on exact match
+and **0.9507** per class - above a model holding half the available signal - so neither
+reading of it can be what a `monitor` watches. Use `metric_balanced_accuracy()`,
+`metric_f1()` or `metric_auc()`.
+
+**`predict()` answers in a different shape on this route**, because the answer is a different
+kind of thing: one row per image *per class*, with `key`, `class`, and `label` and
+`predicted` as logicals. An image with none of the findings is a row of `FALSE` per class
+rather than an empty cell, which could also mean unread - and a split **nobody labelled** is
+`NA`, which is the other half of that sentence and the reason `FALSE` can be trusted to mean
+*measured and absent*. There is no `probability` column - that column is the chosen class's
+own number, and with independent questions nothing was chosen - so `type = "probability"` is
+the whole of the answer there, one column per class.
+
+### Predicting on images you have no labels for
+
+A test set is often just pictures, and that is an ordinary thing to have rather than a
+half-written configuration. Name them in a CSV with no label column - `key, images` and
+nothing else - and the split is read as unlabelled:
+
+```yaml
+task: classification
+data:
+  train_path: data/train.csv
+  validation_path: data/validation.csv
+  test_path: data/to-predict.csv
+  mode: config_file
+  classes: [benign, malignant]
+models:
+  - name: ours
+    input_shape: [224, 224]
+    blocks: 4
+    filters: 16
+```
+
+`predict()` and `evaluate()` then differ in what they can honestly do with it:
+
+- **`predict()` works**, and that is what the split is for. `label` comes back as `NA`
+  rather than as a class name or as `FALSE` per class, because nothing said.
+- **`evaluate()` refuses it by name.** Scoring against labels that are not there would
+  either fail somewhere inside the metric or, worse, report a number - and a zero in a
+  table is read as a result.
+- **`class_balance()` refuses it too**, for the same reason: counted anyway it says every
+  class has no images, which reads as a finding about the dataset rather than about there
+  being nothing to count.
+
+The `key` column is what makes the answer joinable to whatever else you hold - a pixel size,
+a patient identifier, a date - so it is worth writing even where the row order would do.
+
+**One layout cannot do this and the refusal says so.** `nested_dirs` makes the directory the
+label, so there is no unlabelled form of it: an image has to sit somewhere, and where it sits
+is the answer. Point `test_path` at a CSV instead, or at the images themselves.
 
 ## Not training at all
 

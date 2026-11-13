@@ -28,18 +28,31 @@ test_that("instance_data refuses the five fields that do not apply, by not havin
   expect_no_error(instance_data("train/", "valid/"))
 })
 
-test_that("a model names its task through separation, and only through separation", {
+test_that("a model names its task, and separation is what makes it instances", {
+  # These two assertions were `expect_null()` until `#239`: a semantic model returned the
+  # plain list and let `task_of()`'s default speak for it, which is what made a built model
+  # indistinguishable from a bare one. The tag is explicit now and the thing being tested is
+  # unchanged - `separation` is the only field that turns it into instances.
   semantic <- u_net("m", input_shape = c(256, 256))
-  expect_null(attr(semantic, "task", exact = TRUE))
+  expect_identical(attr(semantic, "task", exact = TRUE), "semantic_segmentation")
 
   instance <- u_net("m", input_shape = c(256, 256), separation = separation_rim())
   expect_identical(attr(instance, "task", exact = TRUE), "instance_segmentation")
   expect_identical(instance$separation, list(name = "rim"))
 
-  # `decode` alone must not tag: it is optional on an instance model, so a model that
-  # decoded without predicting a signal would be a specification with no way to produce one.
+  # `decode` alone must not make it an instance model: it is optional on one, so a model
+  # that decoded without predicting a signal would be a specification with no way to
+  # produce one.
   decoded <- u_net("m", input_shape = c(256, 256), decode = list(decode_watershed()))
-  expect_null(attr(decoded, "task", exact = TRUE))
+  expect_identical(attr(decoded, "task", exact = TRUE), "semantic_segmentation")
+
+  # And `weights` without `separation` is the one that admits either, which pyplatypus
+  # `0.8.0a28` permits because the sidecar records what the channels predict.
+  weighted <- u_net("m", input_shape = c(256, 256), weights = "dsbowl-instances")
+  expect_identical(
+    attr(weighted, "task", exact = TRUE),
+    c("semantic_segmentation", "instance_segmentation")
+  )
 })
 
 test_that("all four architectures carry separation, not just the one that was tested", {
@@ -64,16 +77,60 @@ test_that("a separation block sends only what it was given", {
 })
 
 test_that("every decoding the engine offers has a constructor, and they agree on names", {
-  # Written against the names rather than a count, because a count passes when one name is
-  # swapped for another.
+  # This test said "the engine offers" and asked a list written here, so the engine could
+  # have grown a fifth decoding with nothing failing - the shape §4 calls a declaration
+  # beside a mechanism that does not describe it. It asks now, which is what
+  # `available_decodings()` is for beyond discoverability.
+  skip_if_no_engine()
   constructors <- list(
     connected_components = decode_connected_components,
     nearest_seed = decode_nearest_seed,
     watershed = decode_watershed,
     follow_flows = decode_follow_flows
   )
-  for (expected in names(constructors)) {
+  expect_setequal(available_decodings()$name, names(constructors))
+  for (expected in available_decodings()$name) {
+    expect_true(expected %in% names(constructors), info = expected)
     expect_identical(constructors[[expected]](), list(name = expected), info = expected)
+  }
+})
+
+test_that("every separation the engine offers has a constructor too", {
+  skip_if_no_engine()
+  constructors <- list(rim = separation_rim, flows = separation_flows)
+  expect_setequal(available_separations()$name, names(constructors))
+  for (expected in available_separations()$name) {
+    expect_identical(constructors[[expected]](), list(name = expected), info = expected)
+  }
+})
+
+test_that("the two instance listings carry the column they are asked for", {
+  # `needs` is the question somebody opens `available_decodings()` to answer: a decoding
+  # that needs `rim` cannot be put on a model predicting `flows`, and the engine refuses it.
+  # Empty for `connected_components`, which is why it is the one always available.
+  skip_if_no_engine()
+  decodings <- available_decodings()
+  expect_true(all(c("name", "arguments", "description", "needs") %in% names(decodings)))
+  needs <- stats::setNames(decodings$needs, decodings$name)
+  expect_identical(needs[["connected_components"]], "")
+  expect_identical(needs[["follow_flows"]], "flows")
+  expect_identical(needs[["nearest_seed"]], "rim")
+  expect_identical(needs[["watershed"]], "rim")
+
+  separations <- available_separations()
+  expect_true("head_channels" %in% names(separations))
+  widths <- stats::setNames(separations$head_channels, separations$name)
+  expect_identical(as.integer(widths[["rim"]]), 3L)
+  expect_identical(as.integer(widths[["flows"]]), 4L)
+})
+
+test_that("the six listings with no extra field still have exactly three columns", {
+  # The control for the generalisation: columns are taken from the engine's rows, so a bug
+  # there would show as a stray column on every listing rather than a missing one.
+  skip_if_no_engine()
+  for (listing in list(available_tasks, available_models, available_losses,
+                       available_metrics, available_optimizers, available_callbacks)) {
+    expect_identical(names(listing()), c("name", "arguments", "description"))
   }
 })
 
@@ -130,6 +187,10 @@ test_that("an instance data block and an instance model agree on one task", {
 test_that("instance data with a plain segmentation model is refused, and named", {
   # The pair that would otherwise be silent: the same directory layout and the same
   # architecture, differing only in whether a signal is predicted at all.
+  #
+  # Still true after `0.8.0a28` widened what a silent model may be, and this is the case
+  # that kept the widening narrow: a model with no `weights` has nothing to adopt the
+  # separation from, so it cannot be an instance model. `maju116/rplatypus#181`.
   caught <- tryCatch(
     rplatypus:::agreed_task(
       instance_data("a/", "b/"),
@@ -140,6 +201,58 @@ test_that("instance data with a plain segmentation model is refused, and named",
   expect_match(caught, "mixes them")
   expect_match(caught, "the data is instance_segmentation")
   expect_match(caught, "plain is semantic_segmentation")
+})
+
+test_that("a model that leaves the separation to its weights is admissible for instances", {
+  # `0.8.0a28` lets an instance model omit `separation` when `weights` names a file whose
+  # sidecar records what it was trained to predict. R reads a model's task from that field,
+  # so until this a silent model was read as semantic and the pair below was refused as two
+  # tasks in one specification - which made the engine's own headline example, written as
+  # an R snippet, impossible to write in R. `maju116/rplatypus#181`.
+  expect_identical(
+    rplatypus:::agreed_task(
+      instance_data("a/", "b/"),
+      list(u_net("objects", input_shape = c(64, 64), weights = "dsbowl-instances"))
+    ),
+    "instance_segmentation"
+  )
+  # The same model beside semantic data is still semantic: the data decides inside the
+  # overlap, and `weights` widens what a model *may* be rather than what it is.
+  expect_identical(
+    rplatypus:::agreed_task(
+      segmentation_data("a/", "b/", colormap = binary_colormap),
+      list(u_net("m", input_shape = c(64, 64), weights = "dsbowl-unet"))
+    ),
+    "semantic_segmentation"
+  )
+  # And the case the fix must not swallow, which is why it is an intersection rather than
+  # "the data decides when the model is silent": a u_net says nothing about detection.
+  expect_error(
+    rplatypus:::agreed_task(
+      detection_data("a/", "b/", classes = c("rbc", "wbc")),
+      list(u_net("m", input_shape = c(64, 64), weights = "dsbowl-unet"))
+    ),
+    "mixes them"
+  )
+})
+
+test_that("the engine refuses a silent model whose file does not say either", {
+  skip_if_no_engine()
+  # The other half of the permission, and it is the engine's because only the engine can
+  # read a sidecar: a model that leaves `separation` to a *semantic* weights file is
+  # admissible here and refused there, naming the file rather than the field.
+  refused <- rplatypus:::shim()$build_spec(
+    list(
+      task = "instance_segmentation",
+      data = list(train_path = ".", validation_path = "."),
+      models = list(list(name = "objects", input_shape = c(64L, 64L),
+                         weights = "dsbowl-unet"))
+    ),
+    check_paths = FALSE
+  )
+  # The specification itself is accepted - the refusal belongs to `fit`, where the registry
+  # is reachable - so what this asserts is that R's side no longer stands in the way.
+  expect_true(isTRUE(refused$ok))
 })
 
 test_that("stating the task is still checked rather than trusted", {
@@ -299,21 +412,119 @@ r_regions = int(ndimage.label(union)[1])
   expect_identical(reticulate::py$r_regions, 1L)
 })
 
-test_that("predict() refuses instances by name rather than leaking a TypeError", {
-  # Measured before it was written: without the guard this reaches the instance engine's
-  # own predict, which takes no `space`, and the user sees
-  # "TypeError: InstanceEngine.predict() got an unexpected keyword argument 'space'" -
-  # about an argument they never wrote, from a library they never invoked.
-  #
-  # The first wording of the refusal named the engine's Python function, and
-  # test-messages-name-real-functions.R failed it: a message may not point an R reader at
-  # something they cannot call, which is the same rule that caught `summarise_cases()`.
+# --- `predict()` brings the objects back ------------------------------------------------
+#
+# This refused by name until `#103`, and the refusal was right for as long as the bridge had
+# no call that returned a label map. The refusal's own test is replaced rather than kept
+# beside the new behaviour, because a test asserting the old message would now be asserting
+# that the feature is absent.
+#
+# What is still refused, and for reasons rather than for lack of code, is below: `space`,
+# because resampling a label map interpolates between object numbers, and
+# `type = "probability"`, because an instance model's vector channels are not probabilities.
+
+test_that("predict() returns one label map per case, named by the case", {
   skip_if_no_engine()
   root <- tiny_instance_dataset(n = 2)
   fit <- platypus_fit(tiny_instance_spec(root), num_workers = 0)
-  expect_error(predict(fit, split = "validation"), "does not return instances yet")
-  expect_error(predict(fit, split = "validation"), "platypus#103", fixed = TRUE)
-  # And the half that does work is named in the same breath, so the message says what to do
-  # instead rather than only what is missing.
-  expect_error(predict(fit, split = "validation"), "evaluate()", fixed = TRUE)
+  maps <- predict(fit, split = "validation")
+
+  expect_type(maps, "list")
+  expect_length(maps, 2L)
+  # Named rather than ordered. The engine's own list is unnamed, and anything pairing two
+  # sequences by position is one dropped batch away from naming the wrong picture - which is
+  # the reason `predict_stream` exists on the semantic side.
+  expect_true(all(nzchar(names(maps))))
+  expect_identical(names(maps), unique(names(maps)))
+  for (one in maps) {
+    expect_identical(length(dim(one)), 2L)
+    expect_type(as.vector(one), "integer")
+    expect_gte(min(one), 0L)
+  }
+})
+
+test_that("the names are the keys evaluate_cases() reports, not positions", {
+  # The pairing this is worth having: if the names came from somewhere else than the cases
+  # the engine scores, a figure would be labelled with one picture's key and drawn from
+  # another's pixels, and nothing in either object would say so.
+  skip_if_no_engine()
+  root <- tiny_instance_dataset(n = 2)
+  fit <- platypus_fit(tiny_instance_spec(root), num_workers = 0)
+  maps <- predict(fit, split = "validation")
+  # `case` here rather than `key`: an instance case table names the column `case`, which is
+  # what the engine's own rows call it, and a test written against `key` passed `NULL` into
+  # `expect_setequal` and failed for the instrument's reason rather than the pairing's.
+  scored <- evaluate_cases(fit, split = "validation")
+  expect_setequal(names(maps), scored$case)
+})
+
+test_that("`decode` picks the decoding and an unknown one is refused by name", {
+  skip_if_no_engine()
+  root <- tiny_instance_dataset(n = 2)
+  spec <- tiny_instance_spec(
+    root,
+    decode = list(decode_connected_components(), decode_watershed())
+  )
+  fit <- platypus_fit(spec, num_workers = 0)
+  expect_length(predict(fit, split = "validation", decode = "watershed"), 2L)
+  expect_error(predict(fit, split = "validation", decode = "follow_flows"),
+               "does not decode")
+})
+
+test_that("`decode` is refused on a fit that decodes nothing", {
+  skip_if_no_engine()
+  root <- tiny_dataset(n = 2)
+  fit <- platypus_fit(tiny_spec(root), num_workers = 0)
+  expect_error(predict(fit, split = "validation", decode = "watershed"),
+               "only an instance model")
+})
+
+test_that("`space` is refused on an instance fit, and the reason is the label map", {
+  # Not "unsupported": resampling a label map interpolates between object numbers, so
+  # object 3 beside object 5 comes back with a rim of object 4. A refusal that said only
+  # "not supported" would read as a gap somebody might fill.
+  skip_if_no_engine()
+  root <- tiny_instance_dataset(n = 2)
+  fit <- platypus_fit(tiny_instance_spec(root), num_workers = 0)
+  expect_error(predict(fit, split = "validation", space = "source"),
+               "interpolates between object numbers")
+})
+
+test_that("`type = \"probability\"` is refused and `\"channels\"` is what it means", {
+  skip_if_no_engine()
+  root <- tiny_instance_dataset(n = 2)
+  fit <- platypus_fit(tiny_instance_spec(root), num_workers = 0)
+  expect_error(predict(fit, split = "validation", type = "probability"),
+               "not all probabilities")
+  channels <- predict(fit, split = "validation", type = "channels")
+  # Stacked, channels-last, and as many channels as the head has - three for `rim`:
+  # background, interior and the rim band.
+  expect_identical(length(dim(channels)), 4L)
+  expect_identical(dim(channels)[[1]], 2L)
+  expect_identical(dim(channels)[[4]], 3L)
+})
+
+test_that("`type = \"channels\"` is refused where the channels are probabilities", {
+  skip_if_no_engine()
+  root <- tiny_dataset(n = 2)
+  fit <- platypus_fit(tiny_spec(root), num_workers = 0)
+  expect_error(predict(fit, split = "validation", type = "channels"),
+               "ask for `type = \"probability\"`")
+})
+
+test_that("a predicted map draws and measures without leaving R", {
+  # §4: a feature is not shipped until something has used it the way a user reaches it. The
+  # way a user reaches this is predict, then draw, then measure - and the three were built
+  # in two pull requests, so the join is the thing neither of them proved.
+  skip_if_no_engine()
+  root <- tiny_instance_dataset(n = 2)
+  fit <- platypus_fit(tiny_instance_spec(root), num_workers = 0)
+  maps <- predict(fit, split = "validation")
+  one <- maps[[1]]
+  image <- array(0.5, dim = c(dim(one), 3L))
+  drawn <- overlay_instances(image, one)
+  expect_identical(dim(drawn), c(dim(one), 3L))
+  sizes <- instance_sizes(one, spacing = c(0.25, 0.25))
+  expect_identical(names(sizes), c("object", "voxels", "area_mm2"))
+  expect_identical(nrow(sizes), length(setdiff(unique(as.vector(one)), 0L)))
 })

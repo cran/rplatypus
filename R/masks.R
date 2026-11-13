@@ -104,7 +104,12 @@ read_masks <- function(paths, colormap = NULL, labels = NULL, size = NULL, toler
   # quietly become background - and the plot would show a disagreement that is nothing but the
   # resizing.
   if (!is.null(labels)) {
-    values <- read_images(paths, size = size, channels = 1, nearest = TRUE)
+    # `label_map = TRUE`, because these values are class identities: read through 8-bit
+    # greyscale a 16-bit label map arrives with everything above 255 flattened to 255, so
+    # `labels = c(0, 255, 1000)` would match two bands to one class and report nothing
+    # unmatched. `pyplatypus#346`. The colormap branch below is a picture and stays 8-bit.
+    values <- read_images(paths, size = size, channels = 1, nearest = TRUE,
+                          label_map = TRUE)
     return(label_classes(values, labels))
   }
   coloured <- read_images(paths, size = size, channels = 3, nearest = TRUE)
@@ -241,14 +246,102 @@ unite_masks <- function(masks) {
   Reduce(function(a, b) pmax(a, b), masks)
 }
 
+#' The ellipse a segmented structure implies, in millimetres
+#'
+#' What a sonographer writes down. A fetal head circumference is the perimeter of the
+#' ellipse fitted to the skull, and no overlap score stands in for it: two masks with the
+#' same Dice can be eight times apart in millimetres, depending on whether they are wrong in
+#' a ring all the way round or wrong in a ragged edge.
+#'
+#' The fit is not iterative. For a uniform filled ellipse the covariance of the member pixels
+#' has eigenvalues `a^2 / 4` and `b^2 / 4`, so the axes come out of a 2 x 2
+#' eigendecomposition, and the circumference is Ramanujan's second approximation - right to
+#' about `1e-7` relative at the eccentricities a fetal skull has, where `pi * (a + b)`, which
+#' is what one reaches for instead, is wrong by 1.5% at an axis ratio of 0.7.
+#'
+#' The largest connected piece is taken and its holes filled before anything is measured. A
+#' prediction is not an ellipse: it can arrive in two pieces or with a hole in the middle,
+#' and the second moments of either belong to neither - a hole pushes the variance outwards
+#' and a stray island drags the centre.
+#'
+#' @param mask A mask of class indices, as [predict()] returns - one image, not a stack.
+#' @param spacing Pixel size in millimetres, length 2, in the array's own order: rows first,
+#'   then columns. Unset measures in pixels. **Measure on the grid the spacing belongs to**:
+#'   a prediction resized to the model's input shape has pixels of a size nobody recorded,
+#'   so this wants `predict(space = "source")`.
+#' @param class Which class is the structure, numbered from 1 as the colormap and `labels`
+#'   are. Defaults to 2, the foreground of a binary segmentation. It is an argument rather
+#'   than an assumption because this package writes 1 for background where the engine's own
+#'   masks write 0, so treating anything above zero as foreground would measure the whole
+#'   image.
+#' @return A one-row data frame with `major`, `minor` and `circumference` - the two
+#'   semi-axes and the perimeter, in millimetres when `spacing` was given and in pixels
+#'   otherwise. All three are 0 for fewer than three pixels of that class, because a region
+#'   that small has no second moment; that is an ordinary outcome for a model that found
+#'   nothing, not an error.
+#' @seealso [mask_volume()] for the same argument in three dimensions, and
+#'   [instance_sizes()] for it per object.
+#' @export
+#' @examples
+#' # A filled ellipse of 60 x 40 pixels, on half-millimetre pixels: semi-axes of 30 mm and
+#' # 20 mm, whose perimeter is 158.8 mm.
+#' rows <- matrix(rep(seq_len(201), 301), nrow = 201)
+#' columns <- matrix(rep(seq_len(301), each = 201), nrow = 201)
+#' mask <- ifelse(((columns - 150) / 60)^2 + ((rows - 100) / 40)^2 <= 1, 2L, 1L)
+#' \dontrun{
+#' # Wrapped because this one does cross to the engine - unlike [mask_volume()], which is a
+#' # count times a product and stays in R so that a reader needs no Python to run its page.
+#' ellipse_measure(mask, spacing = c(0.5, 0.5))
+#' }
+ellipse_measure <- function(mask, spacing = NULL, class = 2L) {
+  mask <- as.array(mask)
+  if (length(dim(mask)) != 2L) {
+    stop("`mask` must be one image with two dimensions; got ",
+         if (is.null(dim(mask))) "a vector" else paste(dim(mask), collapse = " x "),
+         ". For a stack, measure one image at a time - which is also how `predict()` ",
+         "returns them.", call. = FALSE)
+  }
+  bad_spacing <- !is.null(spacing) &&
+    (length(spacing) != 2L || anyNA(spacing) || any(spacing <= 0))
+  if (bad_spacing) {
+    stop("`spacing` must be two positive numbers, in millimetres - the pixel size, rows ",
+         "first. Got ", length(spacing), ".", call. = FALSE)
+  }
+  # `== class` rather than `> 0`, and this is the whole reason `class` exists: the engine
+  # reads a foreground as anything above zero, which is right for its own `argmax` maps and
+  # would be every pixel of this package's, where `which.max` writes 1 for background.
+  foreground <- mask == as.integer(class)
+  result <- shim()$ellipse_measurement(
+    foreground,
+    if (is.null(spacing)) NULL else as.numeric(spacing)
+  )
+  if (!isTRUE(result$ok)) abort_engine(result)
+  data.frame(
+    major = result$major,
+    minor = result$minor,
+    circumference = result$around,
+    stringsAsFactors = FALSE
+  )
+}
+
 #' How much of each class a mask covers
 #'
 #' A quick sanity check before training: a foreground of half a percent is a problem the
 #' loss has to be chosen for, and it is better to know before the run than after.
 #'
 #' @param mask Class indices, counted from 1.
-#' @param labels Optional names for the classes.
-#' @return A data frame with one row per class.
+#' @param labels Optional names for the classes. **Also what says how many classes there
+#'   are**, when the mask does not hold them all - see the note below.
+#' @param n_class How many classes the mask is meant to have, when `labels` was not given.
+#'   Unset means the largest value present, which is only right when every class occurs.
+#' @return A data frame with one row per class, including the classes with no pixels.
+#'
+#'   **A class above the largest value present used to have no row at all**, which was the
+#'   one case this function is for: `tabulate()` sizes its table by the largest value it
+#'   sees, so a three-class mask holding only 1 and 2 reported two classes and said nothing
+#'   about the third. The highest-numbered class is the usual position of a rare foreground,
+#'   so the row that went missing was the one worth reading.
+#'   `maju116/rplatypus#255`.
 #' @export
 #' @examples
 #' mask <- matrix(1L, 8, 8); mask[2:4, 2:4] <- 2L
@@ -257,8 +350,14 @@ unite_masks <- function(masks) {
 #' # A class with 0 pixels is the thing to look for: its target channel is zero
 #' # everywhere, so there is no gradient towards it and the model is never shown
 #' # what it is being asked to find.
-mask_coverage <- function(mask, labels = NULL) {
-  counts <- tabulate(as.vector(mask))
+mask_coverage <- function(mask, labels = NULL, n_class = NULL) {
+  # `nbins` rather than `tabulate()`'s default, which is `max(mask)` - the whole of
+  # `maju116/rplatypus#255`. The count comes from whatever says how many classes there are:
+  # `n_class` if given, then `labels`, and only then the mask itself.
+  declared <- n_class %||% length(labels)
+  present <- suppressWarnings(max(as.vector(mask), na.rm = TRUE))
+  if (!is.finite(present)) present <- 0L
+  counts <- tabulate(as.vector(mask), nbins = max(declared, present, 0L))
   classes <- seq_along(counts)
   data.frame(
     class = classes,
@@ -296,6 +395,22 @@ check_classes <- function(mask, n_class) {
   invisible(TRUE)
 }
 
+#' How many classes the most ambitious pixel is in
+#'
+#' Read off the array rather than from the specification, because that is what a caller
+#' holding only a prediction can answer - and it is the same test the engine's
+#' `onehot_to_colours` applies, so the two halves refuse the same arrays. A softmax output
+#' never trips it: its channels sum to one, so at most one can reach half.
+#'
+#' `rowSums(..., dims = )` rather than `apply()`: a split of 200 retinas at 2048 px is
+#' 3.4e9 elements and `apply` would build a list over all of them.
+#' @keywords internal
+#' @noRd
+overlapping_channels <- function(masks, threshold = 0.5) {
+  spatial <- length(dim(masks)) - 1L
+  as.integer(max(rowSums(masks >= threshold, dims = spatial)))
+}
+
 #' Write masks to files
 #'
 #' Predictions are only half useful while they are an array in a session. This writes them
@@ -314,6 +429,11 @@ check_classes <- function(mask, n_class) {
 #'   scan each mask came from. This function cannot reliably tell a stack of volumes from a
 #'   stack of images with a class axis - the ranks are identical - so it does not try; it
 #'   refuses only the case a shape can prove.
+#'
+#'   For **overlapping classes** use [save_class_masks()]. A prediction where some pixel is
+#'   in two classes at once is refused here rather than reduced: one pixel gets one colour,
+#'   so writing it as a colour map would mean choosing one of the classes it is in and
+#'   leaving nothing in the file to say that happened.
 #' @param dir Directory to write into; created if it does not exist.
 #' @param colormap A list of RGB triples, one per class.
 #' @param names File names, or the source image paths to take names from. Defaults to
@@ -338,6 +458,16 @@ save_masks <- function(masks, dir, colormap, names = NULL, suffix = "") {
          call. = FALSE)
   }
   if (length(dim(masks)) == 4L) {
+    # Before the `which.max` below, not after: taking the strongest channel of an
+    # overlapping prediction writes a plausible picture of something else, and once it is
+    # written there is nothing in the file that says so.
+    overlapping <- overlapping_channels(masks)
+    if (overlapping > 1L) {
+      stop("a pixel is in ", overlapping, " classes at once, and one pixel gets one ",
+           "colour - taking the strongest would write a plausible picture of something ",
+           "else. These are overlapping classes (`regions`), so write them one file per ",
+           "class with `save_class_masks()`.", call. = FALSE)
+    }
     # Probabilities rather than classes: take the most likely, as predict() would.
     masks <- apply(masks, seq_len(length(dim(masks)) - 1L), which.max)
   }
@@ -358,6 +488,101 @@ save_masks <- function(masks, dir, colormap, names = NULL, suffix = "") {
   paths <- file.path(dir, paste0(names, suffix, ".png"))
 
   result <- shim()$write_masks(coloured, as.list(paths))
+  if (!isTRUE(result$ok)) abort_engine(result)
+  invisible(unlist(result$paths))
+}
+
+#' Write overlapping classes, one file per class
+#'
+#' `regions` gives a channel per named class and a sigmoid per channel, so a pixel may be in
+#' several classes at once - that is the point of it. A colour map cannot hold that: one
+#' pixel gets one colour. [save_masks()] therefore refuses such a prediction, and this is
+#' what it refuses it in favour of - one binary picture per class, named after the class.
+#'
+#' Each file is `<name><suffix>_<class>.png`, black and white, so it opens in anything and
+#' thresholds back to exactly what was written. A class name becomes a filename by replacing
+#' anything outside letters, digits, dot, dash and underscore with `_`, so `whole tumour` is
+#' `whole_tumour` on disk; two class names that become the same filename are refused rather
+#' than written, because one file would hold the second class with the first silently gone.
+#'
+#' A class nothing reaches is written as an empty picture rather than skipped. A missing file
+#' reads as *this run did not produce that class* and an empty one as *it did and the answer
+#' was nothing*, which are different findings and only one of them is true.
+#'
+#' @param masks Channel probabilities from `predict(fit, type = "probability")` - an
+#'   `image x height x width x class` array, or one `height x width x class` array.
+#'
+#'   Class indices are the wrong input and are refused where a shape or a value can prove
+#'   it: any value above 1 is not a probability. What cannot be proved is a stack of
+#'   class-index masks whose values are all 1 - `image x height x width` has the same rank
+#'   as one image's `height x width x class`, exactly as `save_masks()` cannot tell a stack
+#'   of volumes from a stack of images - so that one is read as one image with eight
+#'   channels and caught by `classes` not having eight names.
+#' @param dir Directory to write into; created if it does not exist.
+#' @param classes One name per channel, in channel order, which is the order the regions were
+#'   written in and the order every per-class score is reported in. `inspect_masks()` names
+#'   them the same way. Called `classes` and not `names` because `names` in this family is
+#'   the files - see below.
+#' @param names File name stems, one per image, or the source image paths to take them from.
+#'   Defaults to `mask_0001` and so on. The engine's own function calls this `cases`; in R it
+#'   is `names`, matching [save_masks()] and [save_volumes()], and `classes` carries what the
+#'   engine calls `names`.
+#' @param suffix Added before the class, so predictions from different models can sit in one
+#'   directory without overwriting each other.
+#' @param threshold A class is written where its channel reaches this. 0.5 is what every
+#'   metric in the engine thresholds a channel at, so a different number here writes pictures
+#'   that disagree with the scores printed beside them.
+#' @return The paths written, invisibly, image by image and within an image class by class.
+#' @seealso [save_masks()] for exclusive classes as one colour picture, [save_volumes()] for
+#'   volumes as NIfTI.
+#' @export
+#' @examples
+#' \dontrun{
+#' spec <- platypus_spec(... )
+#' channels <- predict(fit, "brats", split = "test", type = "probability")
+#' save_class_masks(channels, "predictions", classes = c("whole tumour", "core", "enhancing"))
+#' }
+save_class_masks <- function(masks, dir, classes, names = NULL, suffix = "",
+                             threshold = 0.5) {
+  if (length(dim(masks)) == 3L) masks <- array(masks, dim = c(1L, dim(masks)))
+  if (length(dim(masks)) != 4L) {
+    stop("expected channel probabilities - `image x height x width x class`, or one ",
+         "`height x width x class` - got ",
+         paste(dim(masks) %||% length(masks), collapse = " x "),
+         ". `predict(type = \"probability\")` returns that shape.", call. = FALSE)
+  }
+  # Provable rather than guessed: no probability exceeds 1, so a value above it is class
+  # indices. The converse is not provable - a stack of class-index masks that are all
+  # background has the same rank and the same values as a one-hot single image - and that
+  # one is left to the `classes` count, which is the honest division of the two cases.
+  if (max(masks, na.rm = TRUE) > 1 + 1e-8) {
+    stop("these are class indices rather than channel probabilities - the largest value is ",
+         format(max(masks, na.rm = TRUE)), " and no probability exceeds 1. Overlapping ",
+         "classes have no class index: ask `predict()` for ",
+         "`type = \"probability\"`.", call. = FALSE)
+  }
+
+  count <- dim(masks)[1]
+  names <- if (is.null(names)) {
+    sprintf("mask_%04d", seq_len(count))
+  } else {
+    tools::file_path_sans_ext(basename(as.character(names)))
+  }
+  if (length(names) != count) {
+    stop("`names` has ", length(names), " entries but there are ", count, " predictions.",
+         call. = FALSE)
+  }
+
+  # The naming, the thresholding and the refusals are the engine's, deliberately: two
+  # implementations of one set of rules is two things to keep in step, and the filenames
+  # are part of what a user's next script reads.
+  result <- shim()$class_masks(
+    masks, path.expand(dir),
+    classes = as.list(as.character(classes)),
+    cases = as.list(names),
+    threshold = as.numeric(threshold),
+    suffix = as.character(suffix)
+  )
   if (!isTRUE(result$ok)) abort_engine(result)
   invisible(unlist(result$paths))
 }

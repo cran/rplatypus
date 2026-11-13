@@ -12,6 +12,11 @@ from __future__ import annotations
 
 from typing import Any
 
+#: The tasks whose engine does not take `check_masks`, by the `Task` enum's own values.
+#: A detector has no masks and a classifier has one label per image, so there is nothing to
+#: read a sample of - the option is dropped rather than sent and refused.
+TASKS_WITHOUT_MASKS = ("object_detection", "classification")
+
 
 def _failure(error: Any) -> dict:
     payload = error.to_dict() if hasattr(error, "to_dict") else {}
@@ -55,6 +60,39 @@ def spec_as_dict(spec: Any) -> dict:
     return spec.to_dict()
 
 
+def data_facts(spec: Any) -> dict:
+    """What the data block MEANS, as the engine derives it, rather than what it says.
+
+    Two questions R was answering for itself out of the fields, and getting wrong for three
+    of the four class namings:
+
+    `multilabel` - whether a voxel may belong to more than one class. `regions` and
+    `classes_from` both answer yes, and `SegmentationData.multilabel`'s own docstring says
+    *"everything downstream reads this rather than either of them"*. R read `regions` alone,
+    so `predict(type = "class")` returned an argmax over independent sigmoid channels for a
+    `classes_from` fit - every background pixel given a class. `maju116/rplatypus#252`.
+
+    `n_class` - the number of output channels. R counted the colormap, which only one of the
+    four namings fills, so `print()` of a specification said `classes : 0` for the other
+    three. `maju116/rplatypus#256`.
+
+    `naming` is which of the four the block used, so a refusal can name it. Derived here from
+    the fields, because the engine has no single word for it - and it is only ever used in a
+    message, never as the answer to either question above.
+    """
+    data = spec.data
+    naming = None
+    for field in ("colormap", "labels", "regions", "classes_from"):
+        if getattr(data, field, None) is not None:
+            naming = field
+            break
+    return {
+        "multilabel": bool(data.multilabel),
+        "n_class": int(data.n_class),
+        "naming": naming,
+    }
+
+
 def _engine_failure(error: Any) -> dict:
     """A failure during a run, rather than in a specification.
 
@@ -89,8 +127,8 @@ def build_engine(
         options["check_masks"] = False
 
     # `build_engine` picks the engine the spec's task asks for. A detector has no masks to
-    # check, so the option is dropped rather than sent and refused: it is meaningless
-    # there, not disallowed.
+    # check and neither has a classifier, so the option is dropped rather than sent and
+    # refused: it is meaningless there, not disallowed.
     maker = getattr(pyplatypus, "build_engine", None)
     if maker is None:
         return _failure_message(
@@ -98,7 +136,16 @@ def build_engine(
             "specification from a segmentation one. Update platypus, or point "
             "PLATYPUS_ENGINE_PATH at a newer source tree."
         )
-    if getattr(getattr(spec, "task", None), "value", None) == "detection":
+    # The VALUES rather than the words they shorten to, which is the whole of why this
+    # line is written out: the comparison read `== "detection"` while the enum member is
+    # `Task.OBJECT_DETECTION` with the value `"object_detection"`, so it never fired. The
+    # cost was not a missing drop - it was the wrong diagnosis: `check_masks=False` reached
+    # `DetectionEngine`, which has no such argument, and the `TypeError` below reports
+    # "this engine predates `check_masks`" about an engine that is current. Classification
+    # is the second task in this position and `ClassificationEngine` takes no such argument
+    # either, so both are named here and `tests/testthat/test-shim-mask-option.R` holds the
+    # set against the engines' own signatures rather than against this comment.
+    if getattr(getattr(spec, "task", None), "value", None) in TASKS_WITHOUT_MASKS:
         options.pop("check_masks", None)
 
     try:
@@ -148,6 +195,17 @@ def inspect_masks(spec: Any, split: str = "train", limit: int = 500) -> dict:
         "missing_classes": [int(c) for c in report.missing_classes],
         "samples_checked": int(report.samples_checked),
         "total_samples": int(report.total_samples),
+        # The ENGINE's short label per class, not R's own derivation.
+        # `SegmentationData.class_names` is a region's name, a `classes_from` pattern, or
+        # the index for `labels` and `colormap` - where the number IS the class. R held a
+        # copy that covered `regions` alone and numbered the other three, while its
+        # roxygen claimed to mirror the engine. `maju116/rplatypus#259`.
+        #
+        # NOT `_describe_classes`, which is the other job: it writes a sentence for a
+        # refusal - "region 'absent' (of [9])" - and that reads well in a message and
+        # badly in a table. Asking for that one turned five of this package's own
+        # assertions into sentences, which is how the two came to be told apart.
+        "class_names": dict(enumerate(spec.data.class_names)),
     }
 
 
@@ -176,11 +234,17 @@ def run_fit(engine: Any, verbose: bool = False) -> dict:
     }
 
 
-def evaluation_table(engine: Any, split: str = "validation") -> dict:
+def evaluation_table(engine: Any, split: str = "validation", at: str | None = None) -> dict:
+    """The comparison table. `at` picks the grid and is omitted when R did not ask.
+
+    Omitted rather than defaulted here: the engine owns what unset means, and sending
+    `at="model"` from R would make this file a second place the default lives.
+    """
     import pyplatypus
 
     try:
-        return {"ok": True, "table": engine.evaluate(split)}
+        extra = {} if at is None else {"at": str(at)}
+        return {"ok": True, "table": engine.evaluate(split, **extra)}
     except pyplatypus.PlatypusError as error:
         return _failure(error)
     except Exception as error:  # noqa: BLE001
@@ -206,6 +270,43 @@ def predictions(
     import numpy as np
     import pyplatypus
 
+    def to_class(array):
+        # +1 so the classes are 1-based on arrival: R indexes from one, and a mask whose
+        # background is 0 while its colormap starts at 1 is a trap laid for later.
+        return (array.argmax(axis=-1) + 1).astype(np.int32)
+
+    if space == "source":
+        # Source space: one array per scan, each on its own grid, so this cannot become one
+        # array and R receives a list. Keeping the shapes apart is the point - see
+        # `?predict.platypus_fit`.
+        #
+        # Taken from `predict_stream` rather than from `engine.predict`, and the reason is
+        # the NAMES. `predict` returns the arrays alone, so R used to hand back a list a
+        # caller had to pair against case names by position - which that same help page
+        # argues against two lines above the sentence documenting this return, and which
+        # the instance path already avoids. `maju116/rplatypus#223`.
+        #
+        # One pass, not two. A name and a mask that come out of the same `next()` cannot be
+        # misaligned, where a second call to list the split is one `drop_last` from being
+        # off by one - and would also run the model over the split again.
+        cases: list[str] = []
+        masks = []
+        try:
+            for case, probabilities in engine.predict_stream(model_name, split=split, space=space):
+                cases.append(case)
+                masks.append(to_class(probabilities) if as_class else probabilities)
+        except pyplatypus.PlatypusError as error:
+            return _failure(error)
+        except Exception as error:  # noqa: BLE001
+            return _engine_failure(error)
+        return {
+            "ok": True,
+            "masks": masks,
+            "cases": cases,
+            "type": "class" if as_class else "probability",
+            "space": "source",
+        }
+
     try:
         probabilities = engine.predict(model_name, split=split, space=space)
     except pyplatypus.PlatypusError as error:
@@ -213,23 +314,8 @@ def predictions(
     except Exception as error:  # noqa: BLE001
         return _engine_failure(error)
 
-    def to_class(array):
-        # +1 so the classes are 1-based on arrival: R indexes from one, and a mask whose
-        # background is 0 while its colormap starts at 1 is a trap laid for later.
-        return (array.argmax(axis=-1) + 1).astype(np.int32)
-
-    if isinstance(probabilities, list):
-        # Source space: one array per scan, each on its own grid, so this cannot become one
-        # array and R receives a list. Keeping the shapes apart is the point - see
-        # `?predict.platypus_fit`.
-        masks = [to_class(one) if as_class else one for one in probabilities]
-        return {
-            "ok": True,
-            "masks": masks,
-            "type": "class" if as_class else "probability",
-            "space": "source",
-        }
-
+    # Model space is one stacked array rather than a list, so there is nothing to name: the
+    # asymmetry this function carries is between the two SPACES, not between two tasks.
     masks = to_class(probabilities) if as_class else probabilities
     return {
         "ok": True,
@@ -447,22 +533,6 @@ def detection_crops(
     }
 
 
-def anchor_report(engine: Any, model_name: str, split: str = "train") -> dict:
-    """How well the anchors in use cover a split's boxes.
-
-    Worth asking of a split they were *not* fitted on: 0.92 on training and 0.70 on
-    validation says the two hold different objects, and no training curve shows that.
-    """
-    import pyplatypus
-
-    try:
-        return {"ok": True, "coverage": engine.anchor_coverage(model_name, split)}
-    except pyplatypus.PlatypusError as error:
-        return _failure(error)
-    except Exception as error:  # noqa: BLE001
-        return _engine_failure(error)
-
-
 def run_anchors(engine: Any, model_name: str) -> dict:
     """The anchors a run used, and whether they were fitted or given.
 
@@ -507,19 +577,6 @@ def anchor_shapes(engine: Any, model_name: str, split: str = "train") -> dict:
         return _engine_failure(error)
 
 
-def target_survey(engine: Any, model_name: str) -> dict:
-    """What the target could and could not hold, measured before training."""
-    try:
-        run = engine.runs[model_name]
-    except KeyError:
-        return _failure_message(f"no model called '{model_name}'")
-    if run.survey is None:
-        return _failure_message(
-            f"'{model_name}' was not trained, so its targets were never surveyed."
-        )
-    return {"ok": True, "survey": run.survey.to_dict()}
-
-
 def drawing_style() -> dict:
     """The engine's drawing decisions, for the test that holds R's copy to them.
 
@@ -537,68 +594,47 @@ def drawing_style() -> dict:
     return {"ok": True, "style": pyplatypus.drawing_style()}
 
 
-def model_names(engine: Any) -> list:
-    return list(engine.runs)
-
-
 def device_report() -> dict:
-    """Where the work will actually happen, and whether that is what was intended."""
-    import torch
+    """What the engine says about where the work will happen.
 
-    cuda = torch.cuda.is_available()
-    report = {
-        "torch": torch.__version__,
-        "cuda_build": torch.version.cuda or "cpu-only build",
-        "cuda_available": cuda,
-        "device": torch.cuda.get_device_name(0) if cuda else "cpu",
-        "arch_list": list(torch.cuda.get_arch_list()) if cuda else [],
-    }
-    if not cuda:
-        # A card that torch cannot use is worth saying out loud: the run falls back to the
-        # processor and takes perhaps ten times as long, which otherwise looks like
-        # nothing at all going wrong.
-        #
-        # device_count() is the signal, not is_available(). With a CUDA 13 build on a
-        # Pascal card it returns 1 - torch can enumerate the card, it just cannot
-        # initialise it - which is precisely the case worth reporting. Testing for zero
-        # here, as this first did, detects nothing.
-        try:
-            count = torch.cuda.device_count()
-        except Exception:  # noqa: BLE001
-            count = 0
-        report["gpu_present_but_unusable"] = count > 0 or _nvidia_smi_sees_a_gpu()
-    return report
+    A forward since `0.8.0a38`. This function used to own the answer - it asked torch
+    about the version, the build, the card and whether one was present but unusable - and
+    that was the wrong side of the bridge: a Python user could not reach any of it, so
+    the half of this family with more users was the half that could not be told.
 
+    What stays in R is the *advice*: `print.platypus_device()` says to call
+    `platypus_use_torch("pascal")`, which is a sentence about R's session model and means
+    nothing to somebody who installed the engine with pip. Their version of it is "install
+    the pascal extra", and it belongs with the engine.
+    """
+    import pyplatypus
 
-def _nvidia_smi_sees_a_gpu() -> bool:
-    import shutil
-    import subprocess
-
-    if shutil.which("nvidia-smi") is None:
-        return False
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    return out.returncode == 0 and bool(out.stdout.strip())
+    return pyplatypus.device_report()
 
 
 def read_images(
-    paths: list, channels: int = 3, size: list | None = None, nearest: bool = False
+    paths: list,
+    channels: int = 3,
+    size: list | None = None,
+    nearest: bool = False,
+    label_map: bool = False,
 ) -> dict:
     """Read images exactly as the data pipeline would.
 
     Not a convenience: a picture plotted from a differently resized copy is a picture of
     something the model never saw, and the disagreements it shows may be the resizing.
+
+    `label_map` says the file holds class identities rather than brightness, so the engine
+    reads it at full integer width instead of through 8-bit greyscale - which flattened
+    every value above 255 and merged two classes into one. `pyplatypus#346`.
     """
     import numpy as np
     from pyplatypus.data import read_image
+
+    # Passed only when it is asked for, by the rule every new option here follows: an
+    # engine that predates the argument keeps working for everyone not using it. The pin
+    # makes that nearly moot, and `RETICULATE_PYTHON` is the route where it is not.
+    widen = {"label_map": True} if label_map else {}
 
     try:
         arrays = [
@@ -607,6 +643,7 @@ def read_images(
                 channels=int(channels),
                 size=tuple(int(s) for s in size) if size else None,
                 nearest=bool(nearest),
+                **widen,
             )
             for p in paths
         ]
@@ -660,6 +697,224 @@ def write_masks(masks, paths: list) -> dict:
     return {"ok": True, "paths": [str(p) for p in paths]}
 
 
+def instance_predictions(
+    engine: Any,
+    model_name: str,
+    split: str = "test",
+    decode: Any = None,
+) -> dict:
+    """One label map per image, named by the case it came from.
+
+    `predict_instances` returns a bare list in the split's order, and a list paired against
+    a sequence of case names by position is one `drop_last` away from naming the wrong
+    picture - the mistake `predict_stream` exists on the semantic side to avoid. So the keys
+    are read here, from **the same two objects the engine pairs internally**: its own
+    `evaluate_cases` walks `predict_stream` with `enumerate` and takes
+    `dataset.samples[index].key`, which is what this does without re-running the model.
+
+    `decode` picks the decoding by name; unset takes the model's first, which is the
+    engine's own default and not one restated here.
+    """
+    import numpy as np
+    import pyplatypus
+
+    try:
+        maps = engine.predict_instances(
+            model_name, split=split, decode=None if decode is None else str(decode)
+        )
+        run = engine.runs[model_name]
+        keys = [sample.key for sample in engine.dataset(run.spec, split).samples]
+    except pyplatypus.PlatypusError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+
+    if len(keys) != len(maps):
+        # Not a guard against the engine being wrong - it is a guard against this function
+        # being wrong about which dataset it asked. Tiling makes a loader longer than its
+        # samples, and if that ever reached here the names would silently slide by one.
+        return _failure_message(
+            f"the engine returned {len(maps)} label maps and the split names {len(keys)} "
+            "cases, so naming them by position would name the wrong pictures"
+        )
+    return {
+        "ok": True,
+        "cases": list(keys),
+        "maps": [np.asarray(one, dtype=np.int32) for one in maps],
+        "decodings": [block.name for block in engine.runs[model_name].spec.decodings],
+    }
+
+
+def instance_channels(engine: Any, model_name: str, split: str = "test") -> dict:
+    """The model's own channels, raw, which is what a flow field has to be read from.
+
+    Deliberately separate from `instance_predictions`: these are not probabilities. The
+    class channels are, and the vector channels are **raw** - a softmax across a flow
+    component and a class would return a number and mean nothing - so the two cannot be one
+    call with a flag.
+    """
+    import numpy as np
+    import pyplatypus
+
+    try:
+        channels = engine.predict(model_name, split=split)
+    except pyplatypus.PlatypusError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+    return {"ok": True, "channels": np.asarray(channels)}
+
+
+def classification_answers(engine: Any, model_name: str, split: str = "test") -> dict:
+    """One row per image: its key, its label, the answer and every class's probability.
+
+    `engine.answers()` rather than `engine.predict()`, and the difference is the key. A
+    bare array of probabilities has to be paired with the split's samples by position,
+    which is one `drop_last` away from naming the wrong picture - `rplatypus#223` is that
+    defect on the semantic side and there is no reason to ship it again one task across.
+    Both shapes R offers are built from these rows, so the keys and the class order are
+    read once.
+    """
+    import pyplatypus
+
+    try:
+        rows = engine.answers(model_name, split=split)
+    except pyplatypus.PlatypusError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+    return {
+        "ok": True,
+        "rows": rows,
+        # The class order is the specification's, not the columns' - a row's `p_` keys are
+        # built from it, but reading them back off a dict would hand R whatever order the
+        # mapping iterated in.
+        "classes": list(engine.spec.data.classes),
+        # Read off the specification rather than sniffed off a row. The two shapes differ by
+        # which keys they carry - a set of labels has `labels` and no `probability` - so R
+        # could infer it, and an inference from a shape is one release away from being wrong
+        # about a shape that gained a key. `multilabel` is the property the whole engine
+        # reads this from, derived from the naming, which is the thing that carries the
+        # claim.
+        "multilabel": bool(engine.spec.data.multilabel),
+    }
+
+
+def class_balance(spec: Any, split: str = "train") -> dict:
+    """How many images each class has in a split, before anything is trained.
+
+    Built with `strict_data=False` so that a count can be taken of data that is not yet
+    tidy: the question "what have I got" is exactly the one somebody asks when a split is
+    still wrong, and refusing to answer it until the data is perfect would make this
+    useless where it is most wanted.
+
+    `remark` is the engine's own sentence rather than the numbers re-read on R's side. The
+    threshold it fires below is the engine's number, and a copy of it in R would be a second
+    place for one fact to live.
+    """
+    import pyplatypus
+
+    try:
+        engine = pyplatypus.build_engine(spec, strict_data=False)
+        balance = engine.balance(split)
+    except pyplatypus.PlatypusError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+    return {
+        "ok": True,
+        "counts": {str(name): int(count) for name, count in balance.counts.items()},
+        "remark": str(balance),
+    }
+
+
+def class_masks(
+    prediction,
+    directory: str,
+    classes: list,
+    cases: list | None = None,
+    threshold: float = 0.5,
+    suffix: str = "",
+) -> dict:
+    """One file per class, through the engine's own writer.
+
+    Forwarding rather than reimplementing. The filenames, the threshold and every refusal
+    live in `pyplatypus.save_class_masks`, so the two packages cannot disagree about what a
+    region is called on disk - and the filenames are part of what a user's next script
+    reads, which makes them a contract rather than a detail.
+
+    Added for `0.8.0a23`, which is the release that writer arrived in; against an older
+    engine the call fails by name here rather than producing half of it.
+    """
+    import numpy as np
+    import pyplatypus
+
+    if not hasattr(pyplatypus, "save_class_masks"):
+        return _failure_message(
+            "this engine has no `save_class_masks`; one file per class arrived in "
+            f"pyplatypus 0.8.0a23 and the engine in use is {pyplatypus.__version__}"
+        )
+    try:
+        paths = pyplatypus.save_class_masks(
+            np.asarray(prediction, dtype=np.float32),
+            directory,
+            classes=[str(name) for name in classes],
+            cases=None if cases is None else [str(case) for case in cases],
+            threshold=float(threshold),
+            suffix=str(suffix),
+        )
+    except pyplatypus.PlatypusError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+    return {"ok": True, "paths": [str(path) for path in paths]}
+
+
+def write_class_volumes(
+    prediction,
+    directory: str,
+    reference: list,
+    classes: list,
+    cases: list | None = None,
+    threshold: float = 0.5,
+    suffix: str = "",
+) -> dict:
+    """One volume per class, through the engine's own writer.
+
+    Forwarding rather than reimplementing, exactly as `write_class_masks` does one
+    dimension down. Until `0.8.0a29` there was nowhere to forward to: this package carried
+    `write_volumes` with its own logic, and R computed the per-class filenames itself, so
+    the rule for turning `whole tumour` into a filename existed twice and a test had to
+    hold the two together. The engine owns both now.
+
+    Added for `0.8.0a29`; against an older engine the call fails by name here rather than
+    producing half of it.
+    """
+    import numpy as np
+    import pyplatypus
+
+    if not hasattr(pyplatypus, "save_class_volumes"):
+        return _failure_message(
+            "this engine has no `save_class_volumes`; one volume per class arrived in "
+            f"pyplatypus 0.8.0a29 and the engine in use is {pyplatypus.__version__}"
+        )
+    try:
+        paths = pyplatypus.save_class_volumes(
+            [np.asarray(one, dtype=np.float32) for one in prediction],
+            directory,
+            reference=[str(path) for path in reference],
+            classes=[str(name) for name in classes],
+            cases=None if cases is None else [str(case) for case in cases],
+            threshold=float(threshold),
+            suffix=str(suffix),
+        )
+    except pyplatypus.PlatypusError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+    return {"ok": True, "paths": [str(path) for path in paths]}
+
+
 def window_presets() -> dict:
     """The named CT windows, so R does not keep its own copy to drift out of step."""
     from pyplatypus.spec.common import WINDOWS
@@ -709,13 +964,28 @@ def split_data(
 
 
 def case_table(
-    engine: Any, model_name: str, split: str = "validation", group_by: str | None = None
+    engine: Any,
+    model_name: str,
+    split: str = "validation",
+    group_by: str | None = None,
+    at: str | None = None,
+    decode: str | None = None,
 ) -> dict:
-    """One row per case - or per group, with `group_by` - instead of one per model."""
+    """One row per case - or per group, with `group_by` - instead of one per model.
+
+    `decode` reaches only an instance engine, which is why it is passed the way `at` is
+    rather than always: `Engine.evaluate_cases` has no such parameter, so sending it to a
+    semantic fit would be a `TypeError` from the bridge instead of the refusal R already
+    makes by name. `maju116/rplatypus#314` - R could ask for the three decodings' means
+    through `evaluate()` and could not ask which cases made the difference.
+    """
     import pyplatypus
 
     try:
-        rows = engine.evaluate_cases(model_name, split=split, group_by=group_by)
+        extra = {} if at is None else {"at": str(at)}
+        if decode is not None:
+            extra["decode"] = str(decode)
+        rows = engine.evaluate_cases(model_name, split=split, group_by=group_by, **extra)
     except pyplatypus.PlatypusError as error:
         return _failure(error)
     except Exception as error:  # noqa: BLE001
@@ -778,71 +1048,116 @@ def volume_info(paths: list) -> dict:
     return {"ok": True, "volumes": rows}
 
 
+def ellipse_measurement(mask, spacing) -> dict:
+    """The ellipse a region implies: its semi-axes and its circumference, in one crossing.
+
+    Both numbers rather than two functions, because they come from the same second moments
+    and a reader wanting a biometry row wants all three figures together. The engine's
+    `ellipse_axes` and `ellipse_circumference` are separate there for the same reason this
+    is one here: there, a caller composing them pays nothing; here, each call is a crossing.
+
+    **The mask arriving is already boolean**, converted on the R side. The engine reads a
+    foreground as `> 0`, which is right for its own `argmax` maps and silently wrong for
+    this package's: `which.max` writes 1 for background, so `> 0` would be every pixel of
+    every image. R does `mask == class` before sending, and that is why these take no class
+    argument.
+    """
+    from pyplatypus.measure import MeasureError, ellipse_axes, ellipse_circumference
+
+    sides = None if spacing is None else [float(side) for side in spacing]
+    try:
+        major, minor = ellipse_axes(mask, sides)
+        around = ellipse_circumference(mask, sides)
+    except MeasureError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+    return {"ok": True, "major": float(major), "minor": float(minor), "around": float(around)}
+
+
+def instance_shape_rows(labels, spacing) -> dict:
+    """Per-object shape out of one label map, as columns rather than as rows.
+
+    Columns, because the row set has a varying key set - `middle_mm` only for a volume,
+    `eccentricity` only for an image, `_px` instead of `_mm` without a spacing - and a list
+    of dicts with different keys does not become a data frame on the other side without R
+    guessing. `names` carries the order explicitly rather than relying on a Python dict's
+    insertion order surviving the crossing, which is a property nothing here tests.
+
+    **The label map arrives as the engine numbers one**: 0 for background, an integer per
+    object. That is also how this package's instance predictions are numbered, so unlike
+    `ellipse_measurement` this takes no class argument - there is no asymmetry to correct.
+    """
+    from pyplatypus.measure import MeasureError, instance_shapes
+
+    sides = None if spacing is None else [float(side) for side in spacing]
+    try:
+        rows = instance_shapes(labels, sides)
+    except MeasureError as error:
+        return _failure(error)
+    except Exception as error:  # noqa: BLE001
+        return _engine_failure(error)
+
+    # The key set comes from the first row rather than from the rank and the spacing, so
+    # that R is told what the engine actually answered instead of what this function
+    # predicts it would. An empty map has no first row and no columns to name.
+    names = list(rows[0]) if rows else []
+    columns = {
+        name: [int(row[name]) if name == "object" else float(row[name]) for row in rows]
+        for name in names
+    }
+    return {"ok": True, "names": names, "columns": columns, "objects": len(rows)}
+
+
 def write_volumes(masks, paths: list, reference: list) -> dict:
-    """Write label-map volumes as NIfTI, carrying each reference scan's affine.
+    """Label-map volumes as NIfTI, through the engine's own writer.
 
-    The affine is the point. A mask array on its own cannot be laid over the scan it came
-    from: every viewer, every registration tool and every volume calculation reads position
-    and spacing out of the affine, and a file without the right one is either silently
-    misplaced or rejected. So the mask is written with the geometry of the scan it was
-    predicted from, which also means it opens on top of it in any viewer with no further
-    work.
+    Forwarding rather than reimplementing, which it could not do until `0.8.0a29` put a
+    volume writer in the engine and `0.8.0a30` taught it to take a label map. Until then
+    this function carried its own nibabel loop, and the affine decision - that a mask is
+    written against the reference read the way the reader reads it, canonical rather than
+    stored - existed in two places. It is the engine's now.
 
-    Written as integer labels rather than as colours, because that is what a volume format
-    holds and what a segmentation tool expects to read back.
+    **Label maps rather than channels, and that is deliberate.** This package collapses a
+    prediction with `which.max`, so its class indices are counted from 1 and every file it
+    has ever written carries 1 and 2 where the engine's `argmax` would write 0 and 1.
+    Handing the engine the channel form instead would silently change the values in every
+    mask this package produces, so the collapse stays here and the engine writes what it is
+    given.
+
+    `paths` rather than a directory and names: this package has always chosen the whole
+    path, including its refusal when two would collide, and the engine's `cases` argument
+    is a different spelling of the same decision - so the paths are split back into a
+    directory and stems here rather than letting the two disagree about either.
     """
     import pathlib
 
     import numpy as np
+    import pyplatypus
 
+    if not hasattr(pyplatypus, "save_volumes"):
+        return _failure_message(
+            "this engine has no `save_volumes`; writing a volume arrived in pyplatypus "
+            f"0.8.0a29 and the engine in use is {pyplatypus.__version__}"
+        )
+    targets = [pathlib.Path(path) for path in paths]
+    directories = {path.parent for path in targets}
+    if len(directories) != 1:
+        return _failure_message(
+            "the masks would be written to several directories, and one call writes to one"
+        )
     try:
-        import nibabel as nib
-
-        arrays = np.asarray(masks)
-        if arrays.ndim == 3:
-            arrays = arrays[None]
-        if len(arrays) != len(paths):
-            return {
-                "ok": False,
-                "kind": "volume_error",
-                "problems": [],
-                "message": f"{len(arrays)} masks but {len(paths)} paths",
-            }
-        if len(reference) != len(paths):
-            return {
-                "ok": False,
-                "kind": "volume_error",
-                "problems": [],
-                "message": (
-                    f"{len(reference)} reference volumes but {len(paths)} "
-                    "masks; each mask needs the scan it was predicted from"
-                ),
-            }
-
-        written = []
-        for array, path, source in zip(arrays, paths, reference):
-            source_image = nib.as_closest_canonical(nib.load(str(source)))
-            target = pathlib.Path(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-
-            labels = np.asarray(array)
-            if labels.shape != source_image.shape[:3]:
-                return {
-                    "ok": False,
-                    "kind": "volume_error",
-                    "problems": [],
-                    "message": (
-                        f"mask {labels.shape} does not match '{source}' "
-                        f"{tuple(source_image.shape[:3])}. A mask written with the wrong "
-                        "geometry lands in the wrong place, which is worse than failing."
-                    ),
-                }
-            image = nib.Nifti1Image(labels.astype(np.int16), source_image.affine, dtype=np.int16)
-            nib.save(image, str(target))
-            written.append(str(target))
+        written = pyplatypus.save_volumes(
+            [np.asarray(one) for one in masks],
+            directories.pop(),
+            reference=[str(path) for path in reference],
+            cases=[path.name.removesuffix(".nii.gz") for path in targets],
+        )
+    except pyplatypus.PlatypusError as error:
+        return _failure(error)
     except Exception as error:  # noqa: BLE001
         return _engine_failure(error)
-    return {"ok": True, "paths": written}
+    return {"ok": True, "paths": [str(path) for path in written]}
 
 
 def series_report(paths: list) -> dict:
@@ -948,6 +1263,11 @@ def component_listing(kind: str, task: str | None = None) -> dict:
     except Exception as error:  # noqa: BLE001
         return _engine_failure(error)
 
+    # `needs` and `head_channels` belong to two listings only and are the reason somebody
+    # asks for those listings at all: which separation a decoding requires, and how wide a
+    # head a separation makes. Carried when the engine's row has them rather than named
+    # here, so a listing that grows a field reaches R without this function changing.
+    extra = ("needs", "head_channels")
     return {
         "ok": True,
         "rows": [
@@ -955,6 +1275,11 @@ def component_listing(kind: str, task: str | None = None) -> dict:
                 "name": row["name"],
                 "arguments": ", ".join(row.get("arguments", row.get("chooses", ()))),
                 "description": row["description"],
+                **{
+                    key: ", ".join(row[key]) if isinstance(row[key], tuple | list) else row[key]
+                    for key in extra
+                    if key in row
+                },
             }
             for row in rows
         ],

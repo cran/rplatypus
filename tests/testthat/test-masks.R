@@ -177,3 +177,263 @@ test_that("the output directory is created rather than demanded", {
   paths <- save_masks(array(1L, dim = c(1, 8, 8)), out, binary_colormap)
   expect_true(file.exists(paths))
 })
+
+
+# --- overlapping classes cannot be one colour -------------------------------------------
+#
+# `regions` gives a channel per named class and a sigmoid per channel, so two channels can
+# both be hot at one pixel - that is the point of the field. A colour map cannot hold it:
+# one pixel gets one colour, so writing such a prediction as a picture means choosing one
+# of the classes the pixel is in and leaving nothing in the file to say that happened.
+#
+# The detection is read off the array rather than off the specification, which is the same
+# test the engine's `onehot_to_colours` applies - so both halves refuse the same arrays, and
+# a caller holding only a prediction can answer the question. A softmax output never trips
+# it: its channels sum to one, so at most one can reach half. `#152`.
+
+overlapping_prediction <- function(images = 1L, size = 8L) {
+  # Built the way the data stores it - a label map of {0, 1, 2, 4} turned into unions -
+  # rather than by setting channels directly, so the overlap is a consequence rather than
+  # something the test asserted into existence.
+  labels <- array(0L, dim = c(images, size, size))
+  labels[, 1, ] <- 2L
+  labels[, 2, ] <- 1L
+  labels[, 3, ] <- 4L
+  channels <- lapply(list(c(1, 2, 4), c(1, 4), 4), function(of) {
+    as.numeric(labels %in% of)
+  })
+  array(unlist(channels), dim = c(dim(labels), 3L))
+}
+
+test_that("a pixel in several classes is counted rather than guessed at", {
+  expect_identical(rplatypus:::overlapping_channels(overlapping_prediction()), 3L)
+  # The control, and it is the one that matters: a softmax prediction must not be read as
+  # overlapping, or `save_masks()` would refuse every ordinary run.
+  softmax <- array(0, dim = c(1, 8, 8, 3))
+  softmax[, , , 1] <- 0.6
+  softmax[, , , 2] <- 0.3
+  softmax[, , , 3] <- 0.1
+  expect_identical(rplatypus:::overlapping_channels(softmax), 1L)
+})
+
+test_that("save_masks() refuses an overlapping prediction and names where to go", {
+  out <- withr::local_tempdir()
+  expect_error(
+    save_masks(overlapping_prediction(), out, binary_colormap),
+    "3 classes at once"
+  )
+  expect_error(
+    save_masks(overlapping_prediction(), out, binary_colormap),
+    "save_class_masks"
+  )
+  # Refused before anything is written, not after some of it: a directory holding two of
+  # three classes is worse than an error, because it looks like a result.
+  expect_length(list.files(out), 0L)
+})
+
+test_that("save_class_masks() writes one file per class, named after the class", {
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  paths <- save_class_masks(
+    overlapping_prediction(),
+    out,
+    classes = c("whole tumour", "tumour core", "enhancing")
+  )
+  expect_identical(
+    basename(paths),
+    c("mask_0001_whole_tumour.png", "mask_0001_tumour_core.png", "mask_0001_enhancing.png")
+  )
+  # Read back rather than trusting the returned paths, and read back the class each file is
+  # supposed to hold: a writer that put the same channel in all three would pass a test
+  # that only counted files.
+  written <- lapply(paths, function(path) read_masks(path, binary_colormap))
+  names(written) <- basename(paths)
+  expect_true(all(written[["mask_0001_whole_tumour.png"]][1, 2, ] == 2L))
+  expect_true(all(written[["mask_0001_enhancing.png"]][1, 2, ] == 1L))
+  # Row 3 is the pixel value a colour map could not have held: in all three at once.
+  expect_true(all(vapply(written, function(mask) all(mask[1, 3, ] == 2L), logical(1))))
+})
+
+test_that("save_class_masks() takes file names per image and a suffix per model", {
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  paths <- save_class_masks(
+    overlapping_prediction(images = 2L), out,
+    classes = c("a", "b", "c"),
+    names = c("x/scan_01.png", "y/scan_02.tif"), suffix = "_unet"
+  )
+  expect_identical(basename(paths)[c(1, 4)],
+                   c("scan_01_unet_a.png", "scan_02_unet_a.png"))
+})
+
+test_that("save_class_masks() refuses a class name count that does not match", {
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  expect_error(
+    save_class_masks(overlapping_prediction(), out, classes = c("a", "b")),
+    "3 channels and 2 class names"
+  )
+  expect_length(list.files(out), 0L)
+})
+
+test_that("save_class_masks() refuses two class names that become one file", {
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  # The quiet failure this guards: one file would hold the second class, the first would be
+  # silently gone, and the number of returned paths would still be three.
+  expect_error(
+    save_class_masks(overlapping_prediction(), out, classes = c("core 1", "core_1", "x")),
+    "same filename"
+  )
+  expect_length(list.files(out), 0L)
+})
+
+test_that("save_class_masks() refuses class indices where a value can prove it", {
+  out <- withr::local_tempdir()
+  # Provable: no probability exceeds 1. `predict(type = "class")` returns 1-based indices,
+  # so a two-class mask holds a 2.
+  expect_error(
+    save_class_masks(array(2L, dim = c(1, 8, 8, 2)), out, classes = c("a", "b")),
+    "class indices rather than channel probabilities"
+  )
+  expect_length(list.files(out), 0L)
+})
+
+test_that("the case a rank cannot prove is stated rather than detected", {
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  # A stack of two all-background class masks has the same rank and the same values as one
+  # image with eight channels, so this is read as the latter - exactly as `save_masks()`
+  # cannot tell a stack of volumes from a stack of images. What catches it is the count.
+  expect_error(
+    save_class_masks(array(1L, dim = c(2, 8, 8)), out, classes = c("a", "b")),
+    "8 channels and 2 class names"
+  )
+  expect_length(list.files(out), 0L)
+})
+
+test_that("save_class_masks() counts its file names against the images", {
+  out <- withr::local_tempdir()
+  expect_error(
+    save_class_masks(overlapping_prediction(images = 3L), out,
+                     classes = c("a", "b", "c"), names = c("one", "two")),
+    "2 entries but there are 3"
+  )
+  expect_length(list.files(out), 0L)
+})
+
+
+test_that("mask_coverage reports a class with no pixels, including the last one", {
+  # `maju116/rplatypus#255`. `tabulate()` sizes its table by the largest value PRESENT, so a
+  # declared class above it had no row - and the help page's own example says a class with 0
+  # pixels is the thing to look for. The highest-numbered class is the usual position of a
+  # rare foreground, so the row that disappeared was the one worth reading.
+  labels <- c("bg", "liver", "tumour")
+
+  no_tumour <- mask_coverage(matrix(c(1, 1, 2, 2), 2), labels = labels)
+  expect_identical(nrow(no_tumour), 3L)
+  expect_identical(no_tumour$label[3], "tumour")
+  expect_identical(no_tumour$pixels[3], 0L)
+  expect_identical(no_tumour$fraction[3], 0)
+
+  # The control: a missing MIDDLE class was always reported, so the assertion above is about
+  # the last row rather than about counting having started to work at all.
+  no_liver <- mask_coverage(matrix(c(1, 1, 3, 3), 2), labels = labels)
+  expect_identical(nrow(no_liver), 3L)
+  expect_identical(no_liver$pixels, c(2L, 0L, 2L))
+
+  # And the fractions still sum to the share of the mask that is labelled, which is what
+  # would break if the table were widened by padding rather than by counting.
+  expect_equal(sum(no_tumour$fraction), 1)
+})
+
+
+test_that("mask_coverage takes the class count from n_class when there are no labels", {
+  # Without either, the largest value present is all there is to go on - which is the old
+  # behaviour and is correct whenever every class occurs.
+  by_number <- mask_coverage(matrix(c(1, 1, 2, 2), 2), n_class = 4)
+  expect_identical(nrow(by_number), 4L)
+  expect_identical(by_number$pixels, c(2L, 2L, 0L, 0L))
+  expect_identical(by_number$label, paste("class", 1:4))
+
+  # The control: nothing declared, so the answer is what the mask holds.
+  expect_identical(nrow(mask_coverage(matrix(c(1, 1, 2, 2), 2))), 2L)
+})
+
+# ------------------------------------------ a label map stored wider than a byte
+# `pyplatypus#346`, and `rplatypus#262` is R's half of it. `read_masks(labels = )` crosses
+# to the engine's reader with `channels = 1`, and that reader converted through 8-bit
+# greyscale: every value above 255 arrived as 255, so two classes merged into one and
+# `label_classes` reported nothing unmatched.
+
+# The fixture is written through the engine's own imaging library rather than through
+# `png`, which cannot write 16-bit at all - `writePNG` has no bit depth argument. These
+# tests already need the engine to read the file, so writing it the same way costs nothing
+# and the depth is the dtype rather than an argument somebody has to trust.
+write_label_png <- function(path, values, wide = TRUE) {
+  # Written in Python rather than through `reticulate::import`, because reticulate converts
+  # a numpy array straight back to an R one and the dtype - which is the whole point here,
+  # since it is what sets the file's bit depth - does not survive the round trip.
+  lines <- c(
+    "import numpy as np",
+    "from PIL import Image",
+    "values = np.array(%s, dtype=np.%s).reshape(%d, %d)",
+    "Image.fromarray(values).save(%s)"
+  )
+  code <- sprintf(
+    paste(lines, collapse = "\n"),
+    paste0("[", paste(as.vector(t(values)), collapse = ", "), "]"),
+    if (wide) "uint16" else "uint8",
+    nrow(values), ncol(values),
+    paste0("r'", path, "'")
+  )
+  reticulate::py_run_string(code)
+  path
+}
+
+test_that("a 16-bit label map keeps the classes its values name", {
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  values <- matrix(0, nrow = 6, ncol = 4)
+  values[3:4, ] <- 255
+  values[5:6, ] <- 1000
+  path <- write_label_png(file.path(out, "m.png"), values)
+
+  classes <- read_masks(path, labels = c(0, 255, 1000))
+
+  # Counted from 1, as everywhere in the R surface: three bands, three classes.
+  expect_identical(dim(classes), c(1L, 6L, 4L))
+  expect_setequal(unique(as.vector(classes)), c(1L, 2L, 3L))
+  expect_true(all(classes[1, 5:6, ] == 3L))
+})
+
+test_that("the reading that made it a defect is still available on an image", {
+  # The control, and the reason `label_map` is an argument rather than the new default: an
+  # ordinary picture is 0-255 and is divided by 255 downstream, so widening it would stop
+  # it being normalised. The same file read as an image clips, which is correct for one.
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  values <- matrix(c(0, 255, 1000, 300), nrow = 2)
+  path <- write_label_png(file.path(out, "m.png"), values)
+
+  plain <- read_images(path, channels = 1, nearest = TRUE)
+  widened <- read_images(path, channels = 1, nearest = TRUE, label_map = TRUE)
+
+  expect_identical(sort(unique(as.vector(plain))), c(0L, 255L))
+  expect_identical(sort(unique(as.vector(widened))), c(0L, 255L, 300L, 1000L))
+})
+
+test_that("an ordinary 8-bit label map reads the same either way", {
+  # The control that the widening changed nothing for the case every example in this
+  # package ships: an 8-bit file has no value the conversion could have clipped.
+  skip_if_no_engine()
+  out <- withr::local_tempdir()
+  values <- matrix(c(0, 1, 2, 0), nrow = 2)
+  path <- write_label_png(file.path(out, "byte.png"), values, wide = FALSE)
+
+  expect_identical(
+    read_images(path, channels = 1, nearest = TRUE),
+    read_images(path, channels = 1, nearest = TRUE, label_map = TRUE)
+  )
+  expect_setequal(unique(as.vector(read_masks(path, labels = c(0, 1, 2)))), c(1L, 2L, 3L))
+})

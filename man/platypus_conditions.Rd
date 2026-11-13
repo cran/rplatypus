@@ -58,12 +58,14 @@ platypus_image_error             an image could not be read, or is not the shape
 platypus_mask_error              a mask does not match its colormap
 platypus_channel_error           one channel per file, and the files do not agree
 platypus_volume_error            a volume, its orientation or its spacing
+platypus_measure_error          a measurement whose spacing does not fit the array
 platypus_dicom_error             a DICOM file or series
 platypus_augmentation_error      a transform that cannot do what was asked of it
 platypus_detection_error         detection metrics
 platypus_detection_data_error    annotations, boxes or classes
 platypus_instance_error          a separation target, or decoding one into objects
 platypus_instance_data_error     the per-object mask files a case has, or has not
+platypus_label_error             an image's label, or the class directories holding it
 platypus_weights_error           weights that do not belong to this model
 platypus_training_stopped        a callback ended the run early
 platypus_unknown_case            a case or model name that is not in this run
@@ -77,7 +79,7 @@ can answer without troubling Python.
 \section{Why R has more of these than Python does}{
 
 The engine exports three exception classes - \code{PlatypusError}, \code{ConfigError},
-\code{WeightsError} - and raises the other twelve internally, so a Python caller catches
+\code{WeightsError} - and raises the other fifteen internally, so a Python caller catches
 \code{PlatypusError} and inspects it. R derives its class from the \code{kind} the engine sends with
 every failure, so all of them arrive as catchable names. That is a wider surface on this
 side, and deliberately so: R has no exception hierarchy to lean on, and \code{inherits()} is

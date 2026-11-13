@@ -4,6 +4,7 @@
 \alias{losses}
 \alias{loss_iou}
 \alias{loss_dice}
+\alias{loss_generalized_dice}
 \alias{loss_cce}
 \alias{loss_cce_dice}
 \alias{loss_focal}
@@ -19,6 +20,8 @@
 loss_iou(smooth = 1)
 
 loss_dice(smooth = 1)
+
+loss_generalized_dice(smooth = 1)
 
 loss_cce(label_smoothing = 0)
 
@@ -51,10 +54,25 @@ themselves are uncertain, which on a hand-drawn boundary they are.}
 provides. At 0 or 1 it is one of the two alone, which is worth knowing before tuning it
 as though it were a third thing.}
 
-\item{gamma}{For focal losses, how hard to discount the pixels already classified well.}
+\item{gamma}{How hard to discount what is already scoring well, so the gradient comes
+from what is not - but it is \strong{two different parameters} and the defaults differ.
+For \code{loss_focal()} it is the exponent on a single prediction - a pixel or voxel for a
+mask, a whole image for a label, where 0 is plain cross-entropy exactly; the default
+is 2. For \code{loss_focal_tversky()} it is the exponent on \code{1 - TI} over a whole class,
+where 1 is plain Tversky and 0 is refused rather than meaning anything; the default
+is 1. And that second one is \strong{not} the \code{gamma} of Abraham and Khan
+(arXiv:1810.07842), who write the exponent as \code{1/gamma}: theirs is the reciprocal of
+this, so their recommended 4/3 is this argument's 0.75. The two agree only at 1.}
 
-\item{alpha}{For Tversky, the weight on false negatives; raising it buys recall.
-Note that \code{alpha = 0.5} is Dice exactly only when \code{smooth = 0}.}
+\item{alpha}{\strong{Four losses take an \code{alpha} and it means three different things}, so
+read the one for the loss you are writing. For \code{loss_tversky()} and
+\code{loss_focal_tversky()} it is the weight on false negatives; raising it buys recall, and
+\code{alpha = 0.5} is Dice exactly only when \code{smooth = 0}; the default is 0.5. For
+\code{loss_combo()} it is the cross-entropy half's \strong{share of the total} - the objective is
+\code{alpha * cross_entropy + (1 - alpha) * dice}, so raising it moves weight onto
+cross-entropy and does nothing about recall, which in that loss is \code{ce_ratio}'s job;
+the default is 0.5. For \code{loss_focal()} it is a \strong{per-class weight}, \code{1 - alpha} on the
+background class and \code{alpha} on the rest, and the default is \code{NULL}, meaning off.}
 
 \item{ce_ratio}{For \code{loss_combo()}, how its cross-entropy half is tilted between
 punishing missed foreground (towards 1) and false alarms (towards 0), while \code{alpha}
@@ -96,6 +114,35 @@ so they belong in exactly one place: the \code{loss} of \code{\link[=separation_
 is a vector field. Measured against the pinned engine rather than assumed: giving one as
 \strong{any} segmentation model's own \code{loss} is refused by name - semantic or instance - and
 giving a class loss to \code{\link[=separation_flows]{separation_flows()}} is refused by name the other way round.
+
+\strong{One of these weights the classes rather than treating them alike} -
+\code{loss_generalized_dice()}, by the inverse square of how much of the picture each class
+occupies - and the argument usually made for it is not the argument for it here. It is
+introduced in the literature as a fix for Dice being dominated by the background, and
+\code{loss_dice()} in this package is a mean over the class channels: a lesion in 1\% of the
+frame already carries the same weight as the 99\% around it. Measured on a 1\% target, with
+one prediction that finds the lesion and leaks a false positive of equal size and one that
+misses it and gets the background perfect:\tabular{llll}{
+   loss \tab finds it \tab misses it \tab prefers finding by \cr
+   \code{loss_dice()} \tab 0.1658 \tab 0.4731 \tab 0.3073 \cr
+   \code{loss_cce()} \tab 0.1600 \tab 0.1600 \tab nothing at all \cr
+   \code{loss_cce_dice()} \tab 0.1629 \tab 0.3166 \tab 0.1536 \cr
+   \code{loss_generalized_dice()} \tab 0.3278 \tab 0.9511 \tab 0.6233 \cr
+}
+
+
+So what it adds is weight \strong{beyond} an equal share - on that target the classes come out
+weighted 1 to 9801 - and the objective that is genuinely dominated is the per-pixel half
+of \code{loss_cce_dice()}: to cross-entropy a false positive and a missed lesion of the same
+size are the same number of wrong pixels, which is the indifference in that row. Two
+things follow. With every class the same size this is \strong{exactly \code{loss_dice()} pooled over
+the classes}, so on a balanced problem it costs nothing and buys nothing. And it is not a
+third \code{loss_tversky()}: Tversky moves the balance between false positives and false
+negatives by a number you choose, \code{loss_focal_tversky()} reweights the hard pixels, and
+this reweights classes by how much of the image they occupy, computed from each batch
+rather than set by hand - so a batch holding no lesion at all is scored on flat weights,
+which is an argument for a larger \code{batch_size} on a sparse dataset rather than against the
+loss.
 
 This page said \emph{an instance model's own} until the pin moved to \verb{0.8.0a22}, and it was
 true rather than wrong: the refusal lived on the instance class alone, and a semantic

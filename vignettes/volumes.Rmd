@@ -7,6 +7,25 @@ vignette: >
   %\VignetteEncoding{UTF-8}
 ---
 
+<!--
+THIS PROSE HAS A COUNTERPART, AND THIS FILE IS THE SOURCE.
+
+The engine mirrors it as pyplatypus's `volumes.qmd`. It exists, merged as
+maju116/pyplatypus#253, so this pair is compared on both sides - and it was the last
+one, so `awaiting` in tests/testthat/test-article-pairs.R is now empty.
+
+By maju116/rplatypus#117 the vignette is the source and the article is the copy, so an edit
+here is an edit there, and an edit there alone is a mistake nothing will catch. What is held
+by a test is the walk: the `##` headings and their order, asserted from both sides -
+`tests/testthat/test-article-pairs.R` here and `tests/test_articles.py` in the engine. The
+route is deliberately not held, because the engine reaches each destination through a
+configuration file where this package reaches it through constructors.
+
+So: renaming or reordering a `##` heading in this file breaks both suites until the article
+follows. Changing the body of a section breaks neither, and that is the part no test can
+check - a heading test does not stop prose drifting.
+-->
+
 
 
 
@@ -120,8 +139,20 @@ first.
 
 Each of these patients has two studies. Split the twenty-four scans at random and both
 studies of some patient land on opposite sides of the split: the model meets that patient in
-training and is then tested on the same anatomy. Dice comes out several points too high
-and nothing in the result says so.
+training and is then tested on the same anatomy.
+
+**How much that costs is a separate question, and it has now been measured rather than
+asserted.** This paragraph used to end *"Dice comes out several points too high"*, which
+nothing had ever checked. On MSD Spleen - 41 patients, 1043 slices - a slice-level split put
+**29 of 29** development patients on both sides, and the model it produced overstated its own
+score by **+0.035** against patients it had never seen. A patient-level split on the same
+data overstated itself by **+0.039**. So the inflation is real and it is *not* the leak: any
+validation set differs from any test set by a few points because patients differ, and on this
+data the leak added nothing on top of that.
+
+That is one dataset, one architecture and twelve epochs, which is not evidence that the
+mistake is harmless where a model has room to memorise. The reason to keep patients whole is
+that the mechanism is certain and invisible in the result, not that the size is known.
 
 `split_dataset()` takes a pattern that says which part of a name is the patient, and
 keeps every patient whole:
@@ -186,7 +217,7 @@ spec <- platypus_spec(
 )
 spec
 #> platypus specification
-#>   data        : /tmp/RtmpN31LIu/splits/train.csv 
+#>   data        : /tmp/Rtmp81OYn5/splits/train.csv 
 #>   classes     : 0 
 #>   models      : 1 
 #>     lesion         u_net            32x32x32, dice, 12 epochs
@@ -244,7 +275,7 @@ plot(fit)
 ``` r
 evaluate(fit)[, c("model", "loss_function", "dice", "epochs_run")]
 #>    model loss_function      dice epochs_run
-#> 1 lesion          dice 0.9448062         12
+#> 1 lesion          dice 0.9536304         12
 ```
 
 That number hides the distribution, and the distribution is usually the finding. With
@@ -256,16 +287,16 @@ cases <- evaluate_cases(fit, group_by = "^(patient\\d+)_")
 cases
 #> platypus scores by group (3 rows)
 #>      group      dice
-#>  patient06 0.9508058
-#>  patient11 0.9174028
-#>  patient10 0.9661106
+#>  patient06 0.9500000
+#>  patient11 0.9299276
+#>  patient10 0.9808831
 ```
 
 
 ``` r
 summary(cases)
-#>   metric n      mean       sd    median       min       max worst_group
-#> 1   dice 3 0.9447731 0.024908 0.9508058 0.9174028 0.9661106   patient11
+#>   metric n      mean         sd median       min       max worst_group
+#> 1   dice 3 0.9536036 0.02566816   0.95 0.9299276 0.9808831   patient11
 ```
 
 The `worst_group` column is the one that makes this actionable. A mean of any value with a
@@ -316,16 +347,16 @@ sizes
 #>                key predicted_ml   true_ml error_pct
 #> 1 patient06_study1         0.31 0.2680826        16
 #> 2 patient06_study2         0.31 0.2680826        16
-#> 3 patient10_study1         0.98 0.9047787         8
-#> 4 patient10_study2         0.97 0.9047787         7
-#> 5 patient11_study1         0.59 0.5235988        13
-#> 6 patient11_study2         0.59 0.5235988        13
+#> 3 patient10_study1         0.95 0.9047787         5
+#> 4 patient10_study2         0.94 0.9047787         4
+#> 5 patient11_study1         0.56 0.5235988         7
+#> 6 patient11_study2         0.57 0.5235988         9
 ```
 
 These lesions are spheres, so the true volume is known exactly - which is worth doing in a
 synthetic example, because it asks a question Dice cannot. The overlap scores above were
-0.92 to 0.97, respectable
-by any standard; the volumes are 7% to 16% out.
+0.93 to 0.98, respectable
+by any standard; the volumes are 4% to 16% out.
 
 Every number in that sentence is computed rather than typed, and the first half is why: it
 used to read "around 0.88", against the table directly above it. A stale number next to the
@@ -334,9 +365,10 @@ it survived anyway.
 
 That is not a contradiction. Dice is dominated by the interior of an object and forgiving about
 its boundary, and for a small lesion the boundary *is* most of it. A model that draws every
-lesion one voxel too wide scores well and reports a volume that is wrong by a third. If the
-question is *is there a lesion*, the Dice is the relevant number. If it is *has it grown since
-March*, this table is, and the two do not follow from each other.
+lesion one voxel too wide scores well and reports a volume that is wrong by between a quarter
+and twice over, because the error **cubes**: +27% on the 12 mm sphere at 1 mm slices and +95%
+on the 4 mm one. If the question is *is there a lesion*, the Dice is the relevant number. If
+it is *has it grown since March*, this table is, and the two do not follow from each other.
 
 ## Writing a mask back onto its scan
 
@@ -418,8 +450,72 @@ past the gap.
 
 ## What this leaves out
 
-Resampling is offered, not imposed. Several volumes per sample - one per modality, as BraTS
-ships - works through `channels_from`, where the order is stated rather than inferred.
+Resampling is offered, not imposed.
+
+**What it costs to impose it, and the trap in doing so, were measured on MSD Spleen** - 41
+abdominal CTs whose slice thickness runs 1.5 mm to 8 mm and whose voxels differ in volume by
+5.9 times, which is the variation `target_spacing` exists for. Three arms, one `input_shape`
+of 64 cubed, every one scored against the truth as stored:
+
+| what the model reads | dice | worst case | volume error |
+|---|---|---|---|
+| the whole scan, squashed into the shape | 0.709 | 0.014 | 87 ml |
+| `target_spacing = c(1.5, 1.5, 1.5)` | 0.000 | 0.000 | 231 ml |
+| `target_spacing = c(7.5, 7.5, 7.5)` | 0.822 | 0.770 | 29 ml |
+
+of a spleen averaging 234 ml.
+
+**The middle row is the trap and it is total.** Resampling does not only change the scale: it
+changes what `input_shape` *means*. Without it, the shape is the whole scan squashed to fit.
+With it, the shape is a box of so many millimetres taken from the middle - 64 voxels at
+1.5 mm is a 96 mm cube - and a spleen sits up to 165 mm off the centre of the scan and is up
+to 143 mm across. The organ is outside the box in every case, so the model finds nothing at
+all, three runs out of three.
+
+**Choose the field of view in millimetres first**, then the spacing and the shape that cover
+it. Here that is a 480 mm box, and it is worth +0.11 of Dice over resizing and a third of the
+volume error - 14% of the organ against 30%.
+
+The difference in reliability is larger than the difference in the mean: across three runs the
+resampled arm's worst case stayed between 0.72 and 0.77, while the resized arm's was 0.00,
+0.58 and 0.01. It does not score a little lower; it loses a whole scan, a different one each
+time. Which scan is **not** explained by its geometry - the two volumes covering the most
+patient came through fine - and that is an open question rather than a tidy ending.
+
+A coarse 7.5 mm is a poor way to see a boundary, so the arm this did not run is a finer
+spacing with `splits`, which is how a large field of view is covered without a large input.
+`maju116/pyplatypus#201`.
+
+Several volumes per sample - one per modality, as BraTS ships - works through
+`channels_from`, where the order is stated rather than inferred. **That is a design
+claim, so it was measured.** One model was trained on MSD BrainTumour (`CC BY-SA 4.0`)
+with the four sequences named in the order `dataset.json` states, then read back through a
+specification naming the same four patterns with FLAIR and T1 swapped - the same weights,
+the same scans, one difference:
+
+| what channel one holds | dice |
+|---|---|
+| FLAIR, as trained | 0.467 |
+| T1, after one swap in the list | 0.110 |
+
+![The same weights reading one scan through two orders of four files](figures/volumes-channel-order.png)
+
+The case drawn is the **median** of the validation split rather than the best or the worst,
+and it scores 0.540 and 0.160 the two ways round. **Nothing failed.** No error and no empty
+mask: the model returns a region of plausible size and plausible shape in the wrong place,
+which is what a reader would accept from a tool they trust.
+
+The number is the weaker half of this, in two ways. A Dice of 0.467 is not a good tumour
+model - 60 epochs on 120 cases, still improving at the cap - and this measurement does not
+need it to be, because both rows are that same model. And it is a number about one
+permutation of twenty-four and one training budget: the same comparison at a third of the
+training reported 0.023 against 0.233, which is 10% of the right arm where these two are 23%.
+**The ratio moves with how good the model is; what does not move is that the wrong answer
+looks like an answer.**
+
+So take the order from the dataset's own record and check it once, because nothing downstream
+will. Sorting the filenames gives `flair, t1, t1gd, t2` - reproducible, and anatomically
+meaningless. `maju116/pyplatypus#202`.
 
 Object detection, ensembling and pretrained encoders are not here at all.
 

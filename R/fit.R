@@ -18,7 +18,12 @@
 #' waiting and wondering.
 #'
 #' @param spec A [platypus_spec()].
-#' @param device `"cuda"`, `"cpu"`, or `NULL` to use a GPU when one is present.
+#' @param device Where the work happens. The value is handed to torch as given rather than
+#'   checked against a list, so `"cuda"`, `"mps"` and `"cpu"` all reach it, and `"xpu"` is
+#'   forwarded as well - offered rather than promised, since nothing here has run on one.
+#'   `NULL`, the default, takes the first accelerator this machine can actually use and the
+#'   processor when there is none. [platypus_device()] reports which it will be, and why a
+#'   card that is present can still be unusable.
 #' @param num_workers Processes used to read and decode images. `"auto"` picks a small
 #'   number based on the machine. This matters more than it sounds: reading in the main
 #'   process alone leaves the GPU waiting on the disk, and on the Data Science Bowl at
@@ -116,8 +121,45 @@ print.platypus_fit <- function(x, ...) {
 #'
 #' The `loss` column is only comparable between models trained on the same loss, which is
 #' why `loss_function` is there beside it. A Focal-Tversky of 0.05 is not better than a
-#' CCE-Dice of 0.14; it is not even the same question. Metrics stay comparable, because
-#' they measure the mask rather than the objective.
+#' CCE-Dice of 0.14; it is not even the same question.
+#'
+#' The metrics have a condition of their own and `load_shape` is it. Each model is scored on
+#' the grid it reads at, so a model at `input_shape = c(512, 512)` is measured against a
+#' truth reduced to 512 while one that tiles 2048 is measured against the truth as stored.
+#' Both numbers are a real Dice of a real prediction against a real mask, and they are not
+#' answers to the same question: measured on retinal vessels, that difference reported a
+#' resized model as **+0.0187 better** where the honest figure was **+0.0033**, and the bias
+#' runs the other way on clDice because upsampling smooths a prediction. When the rows
+#' disagree about the grid this warns, once; the column is there either way, because a table
+#' outlives the session that printed it.
+#'
+#' `at = "source"` is the answer to that warning rather than a workaround for it: every
+#' prediction goes back onto the grid of the file it came from and is scored against the
+#' truth as stored, so the rows answer one question and `load_shape` reads `source`. The
+#' grid is the files' own and you cannot name another, which is deliberate - a grid you
+#' name resamples the **truth**, so the thing both models are judged against would itself
+#' become an interpolation somebody chose. Here only predictions move, and what that costs
+#' is in `predict()`: interpolation softens a boundary, and where reading cropped anatomy
+#' away the mask comes back padded with background, which means *not examined*. For a
+#' comparison that is correct rather than unfair - a model whose field of view missed the
+#' organ did not segment it - but a 0 arriving that way is a result and not a fault. The
+#' loss is not reported there: a loss belongs to the objective a model trained with, on the
+#' grid it trained on.
+#'
+#' @section What the one row pools:
+#'
+#' The **mean over cases**, since the engine's `0.8.0a40`. A case's own score is a ratio of
+#' sums - where a case arrived in tiles their overlap counts are added and the formula applied
+#' once, which is reassembly rather than a choice of average - and the split's figure is the
+#' mean of those. So this row is exactly `mean(evaluate_cases(fit)$dice)`, which is what
+#' anybody comparing the two expected and did not previously get: the engine divided an
+#' epoch's totals by the number of batches, so a short last batch weighed more than the
+#' others and the figure moved with `batch_size`. On a tiled run the difference was larger
+#' still, because tiles were averaged rather than reassembled - worth +0.033 to +0.049 of Dice
+#' on the retinal-vessel runs.
+#'
+#' [evaluate_cases()] pools a **group** differently again, by adding the counts of the images
+#' in it, which is the better statistic for a patient rather than a slice. `maju116/rplatypus#196`.
 #'
 #' @section A note on the name:
 #' `evaluate` is also exported by the **evaluate** package, which knitr depends on, so the
@@ -129,13 +171,22 @@ print.platypus_fit <- function(x, ...) {
 #'
 #' @param object A [platypus_fit()].
 #' @param split Which data to score on: `"validation"`, `"train"` or `"test"`.
-#' @param ... Unused.
+#' @param at Which grid to score on. `"model"` is each model's own `load_shape`, and
+#'   leaving this unset is that. `"source"` puts every prediction back on the grid of the
+#'   file it came from and scores it against the truth as stored, which is the form in
+#'   which rows from models of different shapes answer one question. Segmentation only: a
+#'   detection table has no grid to choose and says so rather than ignoring the argument.
+#' @param ... Must be empty; a misspelt argument is refused rather than ignored,
+#'   which is what it used to be. `maju116/rplatypus#315`.
 #' @return A data frame, one row per model.
 #' @export
 #' @examples
 #' \dontrun{
 #' evaluate(fit)                      # one row per model, on the validation split
 #' evaluate(fit, split = "test")
+#'
+#' # Two models of different shapes compared on one grid - the files' own.
+#' evaluate(fit, at = "source")
 #'
 #' # A split with no masks is refused by name rather than scored against nothing;
 #' # `predict()` still works on it.
@@ -144,17 +195,49 @@ evaluate <- function(object, ...) UseMethod("evaluate")
 
 #' @rdname evaluate
 #' @export
-evaluate.platypus_fit <- function(object, split = "validation", ...) {
+evaluate.platypus_fit <- function(object, split = "validation", at = NULL, ...) {
+  # THE DOTS ARE THE GENERIC'S CONTRACT AND NOT A PLACE TO PUT ARGUMENTS, so they are
+  # checked rather than ignored. `maju116/rplatypus#315`: eight exported functions took
+  # `...` and no body read one, so `evaluate(fit, splt = "test")` scored the default split
+  # and said nothing - the wrong answer is a correct answer to a different question.
+  #
+  # FIRST in the body, before any refusal this method makes about the task. Put after them
+  # and a typo on a classification fit reports the classification refusal instead, which
+  # sends the reader to the wrong sentence.
+  #
+  # `rlang` is already an import, so this costs no dependency, and the message is the one
+  # R users know from the tidyverse. There was no such check anywhere in `R/` before this.
+  rlang::check_dots_empty()
   result <- if (identical(object$task, "object_detection")) {
+    if (!is.null(at)) {
+      stop("`at` is for segmentation: a detection table reports average precision over ",
+           "boxes, which are in the source image's coordinates already and have no grid ",
+           "to choose.", call. = FALSE)
+    }
     shim()$detection_table(object$engine, split = split)
   } else {
-    shim()$evaluation_table(object$engine, split = split)
+    # `at` chooses the grid a mask is scored on, and a label is not on a grid at all - so
+    # for this task it is refused by name rather than forwarded and ignored. The detection
+    # branch above refuses it for a neighbouring reason: boxes are already in the source
+    # image's coordinates.
+    if (identical(object$task, "classification") && !is.null(at)) {
+      stop("`at` chooses the grid a mask is scored on, and this fit answers with one label ",
+           "per image. There is no grid for the answer to be on and nothing to rescore, so ",
+           "the table is the same whatever `at` would have said.", call. = FALSE)
+    }
+    shim()$evaluation_table(object$engine, split = split, at = at)
   }
   if (!isTRUE(result$ok)) abort_engine(result)
   rows_to_frame(result$table)
 }
 
-#' Predict masks
+#' Predict masks, boxes, objects or labels
+#'
+#' One function per fit rather than one per task, because the question - *what does this
+#' model say about this split* - is the same one. What comes back is not: a mask for
+#' segmentation, a table of boxes for detection, a label map of objects for instances, and
+#' a row per image for classification. The arguments that describe a grid are refused where
+#' there is no grid, by name, rather than accepted and ignored.
 #'
 #' @section Which grid the answer is on:
 #'
@@ -194,23 +277,87 @@ evaluate.platypus_fit <- function(object, split = "validation", ...) {
 #'   first one trained.
 #' @param split Which data to predict on.
 #' @param type `"class"` gives the class index per pixel, which is the mask to look at;
-#'   `"probability"` keeps the per-class channel.
+#'   `"probability"` keeps the per-class channel. `"channels"` is for an **instance** model
+#'   only and means the model's own output before any decoding: the class channels are
+#'   probabilities and a flow field's components are **raw**, which is why they are not
+#'   called probabilities here - a softmax across a flow component and a class returns a
+#'   number that means nothing. Read them with [flow_to_colours()].
+#'
+#'   On an instance fit, `"class"` is a label map of **objects**, numbered from 1, and
+#'   `"probability"` is refused by name for the reason above.
+#'
+#'   With `regions` **or** `classes_from` - the two namings that make a pixel's classes
+#'   independent - `"class"` is **refused** rather than computed. The channels are
+#'   independent binary questions and do not compete, so the most likely one is not an
+#'   answer: a pixel may be in three classes and naming one of them drops the rest with
+#'   nothing in the result to say so. Ask for `"probability"` and write it with
+#'   [save_class_masks()].
+#'
+#'   This page named `regions` alone until `maju116/rplatypus#252`, and so did the refusal:
+#'   a `classes_from` fit got the most likely channel, which gives every background pixel a
+#'   class, because there is no background channel for it to lose to. The question is asked
+#'   of the engine now rather than of either field.
+#'
+#'   On a **classification** fit the two readings are a table and a matrix rather than two
+#'   arrays: `"class"` gives one row per image with the answer and how sure the model was,
+#'   and `"probability"` gives one row per image and one column per class. `"channels"` is
+#'   refused - a classifier has no channels, only one number per class, and those numbers
+#'   are the probabilities.
+#' @param decode Which decoding turns the predicted channels into objects, by the name used
+#'   in the model's `decode` list. Unset takes the model's first, which is the engine's own
+#'   default rather than one restated here. **Instance models only**; for anything else it
+#'   is refused, because a semantic or detection fit decodes nothing.
 #' @param space `"model"` or `"source"`; see above. Note that the two return different
-#'   shapes of thing, an array and a list, because they are different things.
+#'   shapes of thing, an array and a list, because they are different things. Refused on a
+#'   detection, instance or classification fit, each for its own reason - boxes are in the
+#'   source image's coordinates already, an object identity cannot survive resampling, and
+#'   a label is not on a grid at all.
 #' @param cases Case names to predict, as [evaluate_cases()] reports them. With this the
 #'   result is a **named list** of just those, in the order asked for. A name that is not in
-#'   the split is an error rather than a missing entry.
+#'   the split is an error rather than a missing entry. Both this and `each` exist so that a
+#'   split of full-resolution masks never has to be in memory at once, so both are refused
+#'   on a classification fit, where the whole answer is one row per image.
 #' @param each A function called as `each(case, mask)` once per image, instead of the
 #'   predictions being returned together. Whatever it returns is collected under the case's
 #'   name; return `NULL` from it and nothing accumulates. This is the form that does not
 #'   need the split to fit in memory.
-#' @param ... Unused.
+#' @param ... Must be empty; a misspelt argument is refused rather than ignored,
+#'   which is what it used to be. `maju116/rplatypus#315`.
 #' @return With `space = "model"`: for `"class"`, an integer array of
 #'   `image x height x width`, classes numbered from 1 to match the colormap; for
 #'   `"probability"`, the same with a trailing class axis. Tiled models return images at their
 #'   original size, reassembled.
 #'
-#'   With `space = "source"`: a list of such arrays, one per scan, each on that scan's grid.
+#'   With `space = "source"`: a list of such arrays, one per scan, each on that scan's grid,
+#'   **named by case**. The name and the mask come out of one step of the engine's own
+#'   stream, so they cannot be misaligned - which matters because the usual next move is to
+#'   join them to something else per case, and a list paired by position is one dropped
+#'   batch away from naming the wrong picture.
+#'
+#'   On an **instance** fit: a list of integer label maps **named by case**, objects numbered
+#'   from 1 and 0 for background, one entry per image. A list rather than an array for the
+#'   reason the detection one is a list, and named rather than ordered because a list paired
+#'   against case names by position is one dropped batch away from naming the wrong picture.
+#'   Draw them with [overlay_instances()] and measure them with [instance_sizes()].
+#'
+#'   On a **classification** fit: for `"class"`, a data frame of one row per image with
+#'   `key` (the name the split calls it, which is what joins this to anything else), `label`
+#'   (what it was labelled, or `NA` on a split that carries no labelling), `predicted` and
+#'   `probability` - the probability of the class that was chosen, not of the right one. For
+#'   `"probability"`, a numeric matrix of images by classes, with the keys as row names and
+#'   the class names as columns, in the order `classes` was written.
+#'
+#'   **With `labels_from`, where a label is a set, `"class"` is a longer frame instead**:
+#'   one row per image *per class*, with `key`, `class`, and `label` and `predicted` as
+#'   logicals. It is a different answer rather than the same answer with a longer string,
+#'   and this is the shape that says so - an image with none of the findings is a row of
+#'   `FALSE` per class rather than an empty cell, which could also mean unread. Summarise
+#'   per class with one `tapply`, or reshape it if you want it wide.
+#'
+#'   There is no `probability` column on that route, and it is missing on purpose: that
+#'   column is the chosen class's own number, and with independent questions nothing was
+#'   chosen. `"probability"` is the whole of the answer there and comes back as the same
+#'   matrix, one column per class.
 #' @export
 #' @examples
 #' \dontrun{
@@ -230,9 +377,10 @@ evaluate.platypus_fit <- function(object, split = "validation", ...) {
 #' # them to match is how a mask ends up describing anatomy it was not computed from.
 #' }
 predict.platypus_fit <- function(object, model = NULL, split = "test",
-                                 type = c("class", "probability"),
+                                 type = c("class", "probability", "channels"),
                                  space = c("model", "source"),
-                                 cases = NULL, each = NULL, ...) {
+                                 cases = NULL, each = NULL, decode = NULL, ...) {
+  rlang::check_dots_empty()  # `#315`; see `evaluate.platypus_fit` for why it is first
   # Asked before `match.arg` assigns to them: in R, `missing()` on a formal argument stops
   # being true once the argument has been assigned to, so reading it after the two lines
   # below reports "the caller passed this" for every caller. The first version did exactly
@@ -246,6 +394,14 @@ predict.platypus_fit <- function(object, model = NULL, split = "test",
     stop("no model called '", model, "'; this fit has: ",
          paste(object$models, collapse = ", "), call. = FALSE)
   }
+  # Asked of every task rather than of the ones that fall through to the bottom of this
+  # function, which is where it used to sit: the detection branch returns before reaching
+  # it, so `predict(fit, decode = )` on a detector was accepted and silently ignored.
+  if (!is.null(decode) && !identical(object$task, "instance_segmentation")) {
+    stop("`decode` is how predicted channels become objects, which only an instance model ",
+         "does. This fit is ", object$task, ".", call. = FALSE)
+  }
+
   if (identical(object$task, "object_detection")) {
     if (asked_type || asked_space) {
       stop("`type` and `space` are about masks. A detector returns boxes, always in each ",
@@ -257,22 +413,182 @@ predict.platypus_fit <- function(object, model = NULL, split = "test",
     return(as_box_frames(found$detections))
   }
 
-  # Refused by name rather than attempted. Without this the call reaches the instance
-  # engine's `predict()`, which takes no `space`, and an R user gets a raw Python
-  # `TypeError` about a keyword argument they never wrote - the one kind of message this
-  # package has a whole conditions page to avoid. `evaluate()` already scores an instance
-  # run, so the gap is the answer coming back, not the run.
+  if (identical(object$task, "classification")) {
+    if (asked_space) {
+      stop("`space` chooses the grid a mask comes back on, and this fit answers with one ",
+           "label per image. There is no grid for a label to sit on and no inverse to map ",
+           "it through, so neither value of `space` would mean anything.", call. = FALSE)
+    }
+    if (identical(type, "channels")) {
+      stop("`type = \"channels\"` exists for an instance model, whose vector channels are ",
+           "not probabilities. A classifier's output is one number per class and those ",
+           "numbers *are* probabilities, so `type = \"probability\"` is the ask - a matrix ",
+           "with a row per image and a column per class.", call. = FALSE)
+    }
+    if (!is.null(cases) || !is.null(each)) {
+      stop("`cases` and `each` walk a split's masks, one at a time, so that a whole set ",
+           "of them never has to be in memory at once. One label per image is already ",
+           "small: this returns a row per image, so subset the result or walk its rows ",
+           "instead.", call. = FALSE)
+    }
+    found <- shim()$classification_answers(object$engine, model, split = split)
+    if (!isTRUE(found$ok)) abort_engine(found)
+    classes <- as.character(unlist(found$classes))
+    keys <- vapply(found$rows, function(row) as.character(row$key), character(1))
+
+    if (identical(type, "probability")) {
+      # A matrix rather than a data frame, because every column is the same quantity and a
+      # caller plotting an ROC curve or taking a row-wise maximum wants it that way. Named
+      # on both margins: the keys are what joins this to anything else they hold, and the
+      # class order is the specification's rather than whatever order a row's `p_` keys
+      # happened to iterate in.
+      probabilities <- t(vapply(found$rows, function(row) {
+        vapply(classes, function(klass) as.numeric(row[[paste0("p_", klass)]]),
+               numeric(1), USE.NAMES = FALSE)
+      }, numeric(length(classes))))
+      dimnames(probabilities) <- list(keys, classes)
+      return(probabilities)
+    }
+
+    # **A set of labels is a different answer and not the same answer with a longer
+    # string**, so it comes back in a different shape: one row per image per class, with
+    # `label` and `predicted` as logicals. The alternatives were measured against what a
+    # reader does with it. A wide frame needs two columns per class - the truth and the
+    # answer - and names them by pasting, which is how a class called `Mass_label` becomes
+    # ambiguous. A list column holds the sets but nothing in base R aggregates it. Long
+    # form joins to anything by `key`, summarises per class with one `tapply`, and is the
+    # only shape in which "this image has none of the findings" is four rows of FALSE
+    # rather than an empty cell that could also mean unread.
+    #
+    # **And that last clause is why `label` is NA rather than FALSE on an unlabelled
+    # split** (`rplatypus#245`). The argument above rests on FALSE meaning *measured and
+    # absent*, so the shape only keeps "none of them" apart from "unread" if "unread" is
+    # written as something else. `0.8.0a52` made an unlabelled classification test split
+    # reachable - a CSV of `key, images`, which is the ordinary shape of a prediction set -
+    # and the engine marks it by sending `labels: NULL` where a film carrying no finding
+    # sends an empty list. Both arrive here as `character(0)`, so the distinction has to be
+    # read from the NULL rather than from what `%in%` makes of it.
+    #
+    # There is no `probability` column on this route and that is the engine's decision
+    # rather than an omission here: that column is the chosen class's own number, and with
+    # independent questions nothing was chosen. `type = "probability"` above is the whole
+    # of the answer, and it needs no branch - the `p_<class>` keys are in both shapes.
+    if (isTRUE(found$multilabel)) {
+      answers <- do.call(rbind, lapply(found$rows, function(row) {
+        said <- as.character(unlist(row$predicted))
+        # NA for a split nobody labelled, and it is read from the NULL rather than from
+        # the emptiness: `character(0)` is what both an unlabelled image and a film
+        # carrying none of the findings reduce to, and `classes %in% character(0)` is
+        # FALSE either way. `NA` keeps the column logical, so `tapply` and `table` go on
+        # working and a split with no labelling is visible rather than reading as a
+        # dataset in which nothing is ever present.
+        truth <- if (is.null(row$labels)) {
+          rep(NA, length(classes))
+        } else {
+          classes %in% as.character(unlist(row$labels))
+        }
+        data.frame(
+          key = as.character(row$key),
+          # `classes` rather than the row's own order, so two rows are comparable and the
+          # class index is the specification's.
+          class = classes,
+          label = truth,
+          predicted = classes %in% said,
+          stringsAsFactors = FALSE
+        )
+      }))
+      rownames(answers) <- NULL
+      return(answers)
+    }
+
+    # Named by case rather than returned in the split's order alone, which is the lesson
+    # `rplatypus#223` cost on the semantic path: a prediction handed back as a bare
+    # sequence has to be paired with whatever else the caller holds by position, and one
+    # dropped last batch names the wrong picture. `label` is NA on a split that carries no
+    # labelling, which is what a test set often is.
+    answers <- rows_to_frame(lapply(found$rows, function(row) {
+      row[c("key", "label", "predicted", "probability")]
+    }))
+    return(answers)
+  }
+
   if (identical(object$task, "instance_segmentation")) {
-    stop("`predict()` does not return instances yet. The run and its scores do work - ",
-         "`evaluate()` gives a row per model and decoding - but there is no way yet to get ",
-         "the objects themselves back into R: the bridge has no call that returns a label ",
-         "map of them. platypus#103.", call. = FALSE)
+    if (asked_space) {
+      stop("`space` is about a mask on a grid, and an instance result is objects. The ",
+           "engine decodes them on the model's own grid, and there is no inverse that ",
+           "could put an object identity back on the scan's grid: resampling a label map ",
+           "interpolates between object numbers, so object 3 and object 5 become a rim of ",
+           "object 4. Use the maps as they come, or `target_spacing` so the model's grid ",
+           "is the one you want.", call. = FALSE)
+    }
+    if (identical(type, "probability")) {
+      stop("an instance model's channels are not all probabilities, so `type = ",
+           "\"probability\"` would be a name for something that is not one: the class ",
+           "channels are probabilities and the vector channels - a flow field's components ",
+           "- are raw, because a softmax across a flow component and a class returns a ",
+           "number that means nothing. Ask for `type = \"channels\"`, which says what it ",
+           "gives.", call. = FALSE)
+    }
+    if (identical(type, "channels")) {
+      found <- shim()$instance_channels(object$engine, model, split = split)
+      if (!isTRUE(found$ok)) abort_engine(found)
+      return(found$channels)
+    }
+    found <- shim()$instance_predictions(object$engine, model, split = split,
+                                         decode = decode)
+    if (!isTRUE(found$ok)) abort_engine(found)
+    # Named by case rather than returned in the split's order alone. The engine's own list
+    # is unnamed, and anything that pairs two sequences by position is one `drop_last` away
+    # from naming the wrong picture - which is why `predict_stream` exists on the semantic
+    # side. The names come from the same two objects the engine pairs internally.
+    maps <- lapply(found$maps, function(one) array(as.integer(one), dim = dim(one)))
+    names(maps) <- unlist(found$cases)
+    return(maps)
+  }
+  if (identical(type, "channels")) {
+    stop("`type = \"channels\"` exists for an instance model, whose vector channels are ",
+         "not probabilities. For this fit the channels *are* probabilities, so ask for ",
+         "`type = \"probability\"`.", call. = FALSE)
+  }
+
+  # Overlapping classes have no class index to return: each channel is an independent
+  # question, the channels do not compete, and an `argmax` across them names one of the
+  # classes a pixel is in and drops the others. The shape cannot answer this - sigmoid
+  # channels and a softmax's channels are the same array - so it is read off the
+  # specification this fit carries, which is a lever R owns rather than one it borrows.
+  # ASKED of the engine rather than inferred from one field. This read
+  # `length(as.list(object$spec)$data$regions)` until `maju116/rplatypus#252`, and
+  # `classes_from` makes the channels independent exactly as `regions` does - so a
+  # `classes_from` fit got an argmax over sigmoids with no background channel, which gives
+  # every background pixel a class and nothing downstream can see it. The engine has one
+  # switch for this and says so in `SegmentationData.multilabel`'s own docstring.
+  facts <- if (identical(type, "class")) shim()$data_facts(object$spec$py) else NULL
+  if (isTRUE(facts$multilabel)) {
+    # And the message names the naming the caller actually used. It said `regions`
+    # unconditionally, which was the same mistake as the guard one line up: a reader with a
+    # `classes_from` specification would have gone looking for a field they never wrote.
+    stop("this specification names overlapping classes (`", facts$naming, "`), so there ",
+         "is no one class per pixel to return - each channel is an independent question ",
+         "and a pixel may be in several at once. Ask for `type = \"probability\"`, which ",
+         "gives one channel per class in the order they were written, and ",
+         "`save_class_masks()` writes those one file per class. `inspect_masks()` names ",
+         "the channels.", call. = FALSE)
   }
 
   if (is.null(cases) && is.null(each)) {
     result <- shim()$predictions(object$engine, model, split = split,
                                  as_class = identical(type, "class"), space = space)
     if (!isTRUE(result$ok)) abort_engine(result)
+    # Named in source space, where the answer is a list and a caller holding anything else
+    # per case - a pixel size, a reference measurement, a path - would otherwise have to
+    # pair two sequences by position. That is what the paragraph in this function's own help
+    # page warns about, and it was true of this branch until `maju116/rplatypus#223`. Model
+    # space is one stacked array, so there is nothing to name.
+    if (identical(space, "source")) {
+      masks <- result$masks
+      names(masks) <- as.character(unlist(result$cases))
+      return(masks)
+    }
     return(result$masks)
   }
 
@@ -364,7 +680,8 @@ as_box_frames <- function(found) {
 #' @param object A fit from [platypus_fit()] on a detection specification.
 #' @param model Which model, when the specification trained several.
 #' @param split Which split to score.
-#' @param ... Unused.
+#' @param ... Must be empty; a misspelt argument is refused rather than ignored,
+#'   which is what it used to be. `maju116/rplatypus#315`.
 #' @return A data frame, one row per class: average precision at IoU 0.5, the mean overlap
 #'   of the boxes that matched, the number of true boxes, and precision and recall at the
 #'   model's `operating_point`.
@@ -383,10 +700,12 @@ evaluate_classes <- function(object, ...) UseMethod("evaluate_classes")
 #' @export
 evaluate_classes.platypus_fit <- function(object, model = NULL,
                                           split = "validation", ...) {
+  rlang::check_dots_empty()  # `#315`; see `evaluate.platypus_fit` for why it is first
   if (!identical(object$task, "object_detection")) {
     stop("`evaluate_classes()` reports average precision per class, which is a detection ",
          "measure. For segmentation, `evaluate_cases()` reports per case and ",
-         "`summary()` on the result summarises it.", call. = FALSE)
+         "`summary()` on the result summarises it; for classification the per-class ",
+         "figures are `evaluate()`'s own columns.", call. = FALSE)
   }
   model <- model %||% object$models[[1]]
   result <- shim()$detection_classes(object$engine, model, split = split)
@@ -427,9 +746,17 @@ evaluate_classes.platypus_fit <- function(object, model = NULL,
 #'   specification's `operating_point` is used, which is what it is for: "how many were
 #'   missed" is undefined over the whole ranking, where every box the model dimly considered
 #'   counts as a prediction.
-#' @param ... Unused.
+#' @param ... Must be empty; a misspelt argument is refused rather than ignored,
+#'   which is what it used to be. `maju116/rplatypus#315`.
 #' @return A data frame of class `platypus_images`, one row per image: `key`, `n_truth`,
-#'   `n_predicted`, `matched`, `missed`, `spurious` and `mean_matched_iou`.
+#'   `n_predicted`, `matched`, `missed`, `ignored`, `spurious` and `mean_matched_iou`.
+#'
+#'   `ignored` counts predictions attributed to a truth marked `difficult` in a Pascal VOC
+#'   annotation, which Pascal VOC's own evaluation sets aside: calling one `matched` would
+#'   claim the model found something the benchmark left out, and calling it `spurious`
+#'   would charge it for the same thing. So the counts are
+#'   `n_predicted == matched + ignored + spurious`, and `ignored` is zero for a dataset
+#'   that marks nothing difficult.
 #' @seealso [evaluate_classes()] for one row per class, [evaluate_cases()] for the
 #'   segmentation counterpart.
 #' @examples
@@ -445,10 +772,11 @@ evaluate_images <- function(object, ...) UseMethod("evaluate_images")
 #' @export
 evaluate_images.platypus_fit <- function(object, model = NULL, split = "validation",
                                          score_threshold = NULL, ...) {
+  rlang::check_dots_empty()  # `#315`; see `evaluate.platypus_fit` for why it is first
   if (!identical(object$task, "object_detection")) {
     stop("`evaluate_images()` counts boxes per image, which is a detection measure. ",
-         "For segmentation, `evaluate_cases()` scores every case separately.",
-         call. = FALSE)
+         "For segmentation, `evaluate_cases()` scores every case separately; for ",
+         "classification, `predict()` returns one row per image.", call. = FALSE)
   }
   model <- model %||% object$models[[1]]
   if (!model %in% object$models) {
@@ -559,7 +887,6 @@ detection_anchors <- function(object, model = NULL) {
 #' @param size `c(height, width)` every crop is brought to, or `NULL` to keep each as cut.
 #'   Crops of one image differ in size otherwise, which is why this returns a list either way.
 #' @param fit `"letterbox"` to preserve the aspect by padding, `"stretch"` to fill the frame.
-#' @param ... Unused.
 #' @return A list with one entry per image, each a list of `key`, `crops` (a list of
 #'   `height x width x channels` arrays), `boxes`, `scores`, `labels`, `names` and `dropped`.
 #' @export
@@ -573,7 +900,9 @@ detection_anchors <- function(object, model = NULL) {
 #' pieces <- unlist(lapply(found, `[[`, "crops"), recursive = FALSE)
 #' }
 detection_crops <- function(object, model = NULL, split = "test", score_threshold = NULL,
-                            context = 0, size = NULL, fit = "letterbox", ...) {
+                            context = 0, size = NULL, fit = "letterbox") {
+  # No `...` at all: this is a plain export rather than an S3 method, so nothing requires
+  # the dots and R's own `unused argument` is a better message than any check. `#315`.
   if (!inherits(object, "platypus_fit")) {
     stop("`object` must come from `platypus_fit()`.", call. = FALSE)
   }
@@ -606,6 +935,18 @@ detection_crops <- function(object, model = NULL, split = "test", score_threshol
 }
 
 #' The epoch-by-epoch record
+#'
+#' One row per model per epoch, with the loss, whatever metrics were asked for, how long
+#' the epoch took and the learning rate it ran at. Two columns arrive whether or not
+#' anybody asked:
+#'
+#' * **`foreground`** - the share of the prediction that is not background. Not a measure
+#'   of quality, because nothing is compared against the truth: it answers whether the
+#'   model is still producing a segmentation at all. A model collapsing to background
+#'   reports a plausible loss and, with `include_background = TRUE`, a Dice around 0.5.
+#' * **`val_<metric>_worst`** - the lowest any single case scored. The distribution is the
+#'   finding and the mean is where a failure hides, so the number worth reading is in the
+#'   table rather than only in [summary()] after the run.
 #'
 #' @param object A [platypus_fit()].
 #' @return A data frame with one row per model per epoch.
@@ -652,15 +993,37 @@ resolve_workers <- function(x) {
 #'
 #' The engine reports tables as lists of rows, which is what survives the crossing
 #' intact. Missing entries become NA rather than shifting a column.
+#'
+#' A cell has to hold exactly one value, and a cell that holds several is **refused by
+#' column and by row** rather than truncated to its first. Every one of this function's
+#' callers passes something the engine built, so a column arriving here with two values is
+#' a defect in this package or in the engine - never a caller's mistake - and taking the
+#' first would hand back a frame that is wrong and reads as right. The flattening that
+#' makes the catalogue listings fit a frame lives on the engine's side of the bridge, in
+#' `platypus_shim.py`, where a tuple is joined with `", "`; this refusal is what says so
+#' out loud. `rplatypus#307`.
+#'
+#' The flattening here is `unlist()` rather than `[[1]]` for the same reason, one level in:
+#' a cell holding a list of one vector, or a list of one NULL, defeats a length taken
+#' before flattening - the first would widen the column and the second would shift it.
 #' @keywords internal
 #' @noRd
 rows_to_frame <- function(rows) {
   if (!length(rows)) return(data.frame())
   columns <- unique(unlist(lapply(rows, names)))
   frame <- lapply(columns, function(column) {
-    values <- lapply(rows, function(row) {
-      value <- row[[column]]
-      if (is.null(value) || !length(value)) NA else value[[1]]
+    values <- lapply(seq_along(rows), function(index) {
+      value <- unlist(rows[[index]][[column]], use.names = FALSE)
+      if (!length(value)) return(NA)
+      if (length(value) > 1) {
+        stop("the engine's column `", column, "` holds ", length(value),
+             " values in row ", index, ", and one cell of a data frame holds one. ",
+             "A listing's row is flattened before it crosses the bridge, so this is a ",
+             "defect in rplatypus or in the engine rather than something you did - ",
+             "please report it. Keeping the first value would hide the rest.",
+             call. = FALSE)
+      }
+      value
     })
     unlist(values)
   })
@@ -689,7 +1052,16 @@ rows_to_frame <- function(rows) {
 #' @param group_by A pattern picking a group out of each case's name, as in
 #'   [split_dataset()]. With it, the rows are patients rather than slices: a patient's
 #'   slices are pooled into one score, the way a volume would be.
-#' @param ... Unused.
+#' @param at Which grid to score on, as in [evaluate()]. Unset is the model's own
+#'   `load_shape`; `"source"` reads each truth as stored and scores the prediction there,
+#'   which is the only form in which rows from two models - or from two runs with different
+#'   `target_spacing` - mean the same thing.
+#' @param decode Which decoding's cases to score, by the name used in the model's `decode`
+#'   list. Unset takes the model's first, which is the engine's own default. Only an
+#'   instance fit decodes anything, so naming it on any other task is refused rather than
+#'   ignored - and `evaluate()` is where the per-decoding means are, one row each.
+#' @param ... Must be empty. Accepted because the generic has it, and checked rather than
+#'   ignored so that a misspelt argument is refused instead of changing the answer.
 #' @return A data frame with one row per case, of class `platypus_cases`.
 #' @seealso [split_dataset()] for keeping a patient out of two sets in the first place.
 #' @examples
@@ -699,6 +1071,9 @@ rows_to_frame <- function(rows) {
 #' head(cases[order(cases$dice), ])          # the ones worth looking at
 #'
 #' evaluate_cases(fit, group_by = "^(patient\\\\d+)_")
+#'
+#' # On the grid the files are on, which is what makes two models comparable.
+#' evaluate_cases(fit, at = "source")
 #' }
 #' @export
 evaluate_cases <- function(object, ...) UseMethod("evaluate_cases")
@@ -706,13 +1081,43 @@ evaluate_cases <- function(object, ...) UseMethod("evaluate_cases")
 #' @rdname evaluate_cases
 #' @export
 evaluate_cases.platypus_fit <- function(object, model = NULL, split = "validation",
-                                        group_by = NULL, ...) {
+                                        group_by = NULL, at = NULL, decode = NULL, ...) {
+  rlang::check_dots_empty()  # `#315`; see `evaluate.platypus_fit` for why it is first
+  # `decode` IS the question an instance fit's per-case table is asked. `maju116/rplatypus#314`:
+  # an instance model with two decodings gets a row per decoding from `evaluate()`, and this
+  # could only ever return the FIRST one's cases - with `decode = "watershed"` swallowed by
+  # the dots rather than refused, so the reader got the other decoding's numbers under the
+  # name they asked for. `dsbowl-instances` publishes one trained file whose three decodings
+  # are 0.0623 apart, which is the comparison this table exists to make readable per case.
+  #
+  # Refused by name off an instance fit, copying `predict.platypus_fit`'s own repair of the
+  # same shape: there the detection branch returned before the check was reached, so
+  # `predict(fit, decode = )` on a detector was accepted and ignored.
+  if (!is.null(decode) && !identical(object$task, "instance_segmentation")) {
+    stop("`decode` names which decoding turns predicted channels into objects, which only ",
+         "an instance model does. This fit is ", object$task, ".", call. = FALSE)
+  }
+  # Refused rather than returned, because the number it would report carries no
+  # information. A case on the segmentation side is an image with hundreds of thousands of
+  # voxels and a score of its own, which is what makes the minimum worth publishing; one
+  # image's accuracy is 0 or 1, so a split's worst case is 0 for any model that gets a
+  # single image wrong. The engine says the same thing by having no `_worst` column here.
+  if (identical(object$task, "classification")) {
+    stop("`evaluate_cases()` scores every case separately, and a case here is one image ",
+         "whose score is 0 or 1 - so the worst case of a split is 0 for any model that ",
+         "gets one image wrong, and the spread carries nothing. `predict()` returns a row ",
+         "per image with the answer and every class's probability, and `evaluate()` ",
+         "reports the per-class figures - `balanced_accuracy` and `f1` - which is the ",
+         "question this one is asking.", call. = FALSE)
+  }
   model <- model %||% object$models[[1]]
   if (!model %in% object$models) {
     stop("no model called '", model, "'; this fit has: ",
          paste(object$models, collapse = ", "), call. = FALSE)
   }
-  result <- shim()$case_table(object$engine, model, split = split, group_by = group_by)
+  result <- shim()$case_table(
+    object$engine, model, split = split, group_by = group_by, at = at, decode = decode
+  )
   if (!isTRUE(result$ok)) abort_engine(result)
 
   frame <- rows_to_frame(result$table)
@@ -723,6 +1128,7 @@ evaluate_cases.platypus_fit <- function(object, model = NULL, split = "validatio
 #' @rdname evaluate_cases
 #' @export
 summary.platypus_cases <- function(object, ...) {
+  rlang::check_dots_empty()  # `#315`; see `evaluate.platypus_fit` for why it is first
   rows <- lapply(seq_len(nrow(object)), function(i) as.list(object[i, , drop = FALSE]))
   result <- shim()$case_summary(rows)
   if (!isTRUE(result$ok)) abort_engine(result)
@@ -793,6 +1199,65 @@ available_weights <- function() {
 #' weights whose provenance lives in somebody's memory cannot be used by anybody else, including
 #' you in a year.
 #'
+#' @section What the engine writes without being asked:
+#' Two things, since engine `0.8.0a75`, and they are the ones a caller is in no position to
+#' know: `trained_with`, the engine version that produced the file, and `measured_with` - the
+#' engine that measured the figures beside the weights **and the configuration it measured
+#' them with**, resolved rather than as it was written.
+#'
+#' Resolved is the whole point. `metric_cldice()`'s `iterations` is the skeleton's peel count;
+#' it moves the number by about five points on one published set of weights, and before this
+#' it appeared in no file, because nobody had written it down - it was the metric's own
+#' default. A sidecar recording only what a configuration *stated* would have recorded nothing
+#' about it.
+#'
+#' What is in the block is task-specific, because the question is. The MODEL's half asks how
+#' the figures were computed: a segmentation or classification fit records its metrics, an
+#' instance fit adds how objects were separated and decoded, and a detection fit records the
+#' three thresholds its table moves with and has no metric list at all.
+#'
+#' And since engine `0.8.0a79` the block carries the DATA's half beside it - how the data was
+#' *read*, which decides what the figures were measured **on** rather than how they were
+#' computed. `window` for every task, and `channels_from` and `target_spacing` for a
+#' SEMANTIC segmentation fit only - an instance fit records neither, because the two halves
+#' of a specification inherit differently: an instance model extends the segmentation model
+#' and so has `splits`, while instance *data* extends the base data class and so has only
+#' `window`. The reason they belong there is the reason `splits` does:
+#' they change a reported number while the weights and the data stay the same. Reading the
+#' same volumes at a different `target_spacing` scores a different number of real voxels at
+#' an identical model input shape, and a scan read on a lung window is not the picture the
+#' same scan is on a soft-tissue one.
+#'
+#' And since engine `0.8.0a80` the same block answers a second question about the data:
+#' **which cases were scored**. `split` is recorded when a run partitions one folder instead
+#' of naming a second, and it is the companion to the paragraph above rather than more of it -
+#' that one says what the pictures looked like when they were measured, this one says which
+#' pictures there were. A reader who has the first and not the second can reproduce the
+#' windowing and still score a different set of images.
+#'
+#' It is recorded **resolved**, which is where its value is. `fractions` alone describes a
+#' partition; `fractions` with `group_by` and `seed` and the files that were found determines
+#' it. So `seed` is there even when nobody wrote one - it defaults to 0 and arrives by
+#' resolution - and `group_by` is there because that is what makes a split by patient rather
+#' than by slice, which is the difference [split_dataset()] exists to let you keep.
+#'
+#' **`split` is not `splits`**, and they now sit in the same block one letter apart. `split`
+#' is the data's partition: which cases were held out. `splits` is the model's tiling: a
+#' source image read at `splits` times `input_shape` and cut into pieces. One decides how
+#' many cases there are, the other which pictures a metric sees inside one case.
+#'
+#' **The data's half records only what was set**, and that asymmetry is the useful part. A
+#' missing `split` means *this run named a second folder*, so nothing was partitioned, and a
+#' missing `target_spacing` means *this run named none*, not *resampled to nothing*: the
+#' field defaults to `NULL`, and a record that wrote `null` could not be told apart from one
+#' written by an engine too old to answer. `window` is the exception and is always there,
+#' because it always has a value - `"auto"` is a windowing rather than an absence, and it
+#' means *whatever window the file itself recorded*, so two datasets read with `"auto"` are
+#' not necessarily read alike.
+#'
+#' Passing either of those names in `...` is refused rather than ignored, because a caller's
+#' copy of a fact only the engine knows is a copy that will drift.
+#'
 #' @param object A [platypus_fit()].
 #' @param path Where to write, with or without the `.safetensors` extension.
 #' @param model Which model, by the name in the specification. Defaults to the first.
@@ -824,6 +1289,46 @@ export_weights <- function(object, path, model = NULL, ...) {
 }
 
 
+#' Class indices as the specification named them, where it named them
+#'
+#' The engine reports classes by position, and with `regions` a position is the one thing a
+#' reader cannot resolve: `missing_classes: 1` means the second region, and counting regions
+#' in a configuration file to find out which is the step nobody takes. With `colormap` or
+#' `labels` the number *is* the class, so it stays a number.
+#'
+#' **Read from the engine rather than derived here, since `maju116/rplatypus#259`.** The
+#' sentence that stood here said the opposite - that deriving it in R avoided "a release and
+#' a pin move for a label" - and that reasoning is what made the copy diverge. It was also
+#' false: the shim builds an engine inside `inspect_masks` already, so asking that engine to
+#' name each class costs nothing and needs no release. What R derived handled `regions` and
+#' numbered everything else, while `EngineBase._describe_classes` names a region, a
+#' `classes_from` pattern, a `labels` value and a `colormap` colour - so the claim that this
+#' mirrored it was false for three namings out of four.
+#'
+#' The engine is asked one index at a time, because its own call joins several into one
+#' sentence for a refusal and R needs them apart. An index the engine did not describe keeps
+#' its number, so a report never loses one it cannot name.
+#'
+#' @keywords internal
+#' @noRd
+named_classes <- function(described, indices) {
+  indices <- unique(as.integer(indices))
+  out <- stats::setNames(as.character(indices), as.character(indices))
+  if (!length(indices) || !length(described)) return(out)
+  # READ from the engine rather than derived here. This used to take `spec` and name a
+  # class from `data$regions` alone, while its own roxygen said it mirrored
+  # `EngineBase._describe_classes` - which names a region, a `classes_from` pattern, a
+  # `labels` value and a `colormap` colour. So the claim was false for three namings out
+  # of four, and `inspect_masks()` answered `missing_classes: 1` where the engine's own
+  # refusal for the same data says "class 1 (files matching '_organ\.png$')" - which is
+  # the one thing `?inspect_masks` says a reader cannot work out for themselves.
+  # `maju116/rplatypus#259`.
+  # reticulate turns the engine's `{0: 'one', 1: 'both'}` into a list named "0", "1".
+  known <- as.character(indices)[as.character(indices) %in% names(described)]
+  out[known] <- vapply(described[known], as.character, character(1))
+  out
+}
+
 #' What the colormap or labels match in your masks
 #'
 #' Reads a sample of one split's masks and reports what the specification's colours, or
@@ -841,6 +1346,17 @@ export_weights <- function(object, path, model = NULL, ...) {
 #' it and the model is never shown the thing it is being asked to find. Either the colours
 #' do not describe these masks, or they name a class the data does not contain.
 #'
+#' **With `regions` the classes are named rather than numbered**, because a position is the
+#' one thing a reader cannot resolve: `missing_classes: 1` means the second region, and
+#' counting entries in a configuration file to find out which is the step nobody takes. The
+#' positions are still there, as the `missing` and `present` attributes.
+#'
+#' That naming matters most for the one failure `regions` invites: `of = 3` against a label
+#' map holding `4` is a channel of zeros, so the model trains to predict nothing and scores a
+#' Dice of 0 for that region while every other number in the run looks ordinary. The engine
+#' refuses it before training and names the region; this is how to ask the same question over
+#' more of the data than the refusal reads.
+#'
 #' `unmatched` is the fraction of mask pixels matching no entry, which fall back to the
 #' background class. **Read it knowing that it scales with the size of the thing being
 #' segmented**, so it is loud for a large structure and almost silent for a small lesion.
@@ -856,8 +1372,10 @@ export_weights <- function(object, path, model = NULL, ...) {
 #'   the beginning.
 #' @return A one-row data frame: `unmatched`, `samples_checked`, `total_samples`, and
 #'   `present_classes` and `missing_classes` as comma-separated strings so the frame
-#'   stays printable. The classes are also attached as integer vectors in the attributes
-#'   `present` and `missing`.
+#'   stays printable - **region names where the specification gave `regions`**, and class
+#'   numbers otherwise, which is what the engine's own refusal does. The positions are
+#'   attached as integer vectors in the attributes `present` and `missing` either way, so
+#'   anything reading them keeps working.
 #' @export
 #' @examples
 #' \dontrun{
@@ -874,14 +1392,15 @@ inspect_masks <- function(spec, split = c("train", "validation", "test"), limit 
 
   present <- as.integer(unlist(result$present_classes))
   missing <- as.integer(unlist(result$missing_classes))
+  named <- named_classes(result$class_names, c(present, missing))
   out <- data.frame(
     split = split,
     unmatched = as.numeric(result$unmatched),
     samples_checked = as.integer(result$samples_checked),
     total_samples = as.integer(result$total_samples),
-    present_classes = paste(present, collapse = ", "),
+    present_classes = paste(named[as.character(present)], collapse = ", "),
     # An empty string rather than NA: nothing missing is a result, not an absence of one.
-    missing_classes = paste(missing, collapse = ", "),
+    missing_classes = paste(named[as.character(missing)], collapse = ", "),
     stringsAsFactors = FALSE
   )
   attr(out, "present") <- present

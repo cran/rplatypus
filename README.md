@@ -8,6 +8,7 @@ figure.**
 <!-- badges: start -->
 [![R-CMD-check](https://github.com/maju116/rplatypus/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/maju116/rplatypus/actions/workflows/R-CMD-check.yaml)
 [![docs](https://github.com/maju116/rplatypus/actions/workflows/docs.yaml/badge.svg)](https://maju116.github.io/rplatypus/)
+[![CRAN status](https://www.r-pkg.org/badges/version/rplatypus)](https://CRAN.R-project.org/package=rplatypus)
 <!-- badges: end -->
 
 > **This is a rewrite, and an alpha.** The package released in 2020 was built on
@@ -17,21 +18,46 @@ figure.**
 > branch.
 
 R has excellent tools for reading medical images and a healthy deep learning stack, and
-almost nothing joining them: as of August 2025 the CRAN Task View for *Medical Image
-Analysis* listed no deep learning packages at all. This is an attempt at the missing
+almost nothing joining them: re-counted on 2026-11-05, the CRAN Task View for *Medical
+Image Analysis* lists 49 packages and not one of them is a neural network. This is an attempt at the missing
 piece — not a wrapper around a Python library you then have to learn, but an R package
 that happens to compute in Python.
 
 ## Installing
 
 ```r
-# install.packages("remotes")
-remotes::install_github("maju116/rplatypus")
+install.packages("rplatypus")
 ```
+
+```r
+# or the branch where work lands between submissions
+# install.packages("remotes")
+remotes::install_github("maju116/rplatypus@new-release")
+```
+
+**There are three states here rather than two, and the middle one is easy to miss.** CRAN
+carries the version that was submitted and accepted. The default branch is the submission
+**candidate** - what has been sent, or is about to be - so `install_github("maju116/rplatypus")`
+serves that rather than the newest work. `new-release` is where the work lands, which means a
+fix made after a submission is frozen lives there and nowhere else until the next one goes
+out, and the policy asks for no more than one every one to two months. Take CRAN unless you
+are waiting on something specific, and `@new-release` when that something was fixed after the
+last submission left.
 
 There is nothing to set up afterwards. The first call that needs the engine builds an
 isolated Python environment for it, and everything after that uses the cache. You never
 choose an interpreter, activate anything, or match a version.
+
+**Three things are worth knowing before that first call, and all three are about PyTorch
+rather than about this package.** It downloads about 5 GB, because the wheel carries CUDA
+whether or not there is a GPU - cached afterwards, and portable to a machine with no
+connection. **On a GeForce GTX 10-series card or older, call `platypus_use_torch("pascal")`
+first**: current builds target CUDA 13, which dropped that generation, so without it
+everything trains on the processor - perhaps ten times slower, with nothing obviously
+wrong. `platypus_device()` says which one you got. And **on macOS this needs Apple
+Silicon**: torch has published no macOS x86_64 wheel since 2.2.2, so on an Intel Mac the
+engine cannot be built at all, and the first call is where you find that out. *About the
+engine*, below, has all three in full.
 
 **The package was called `platypus` until 2026-10-14** and is `rplatypus` now - one name per
 language, beside the `pyplatypus` engine on PyPI. The repository moved with it, so
@@ -120,10 +146,29 @@ can be handed to a colleague.
 convolutions, spatial dropout, interpolated or learned upsampling, deep supervision and
 block width.
 
-**Nine losses** (IoU, Dice, cross-entropy, CCE-Dice, Focal, Tversky, Focal-Tversky, Combo,
-Lovász) and **three metrics**, each of which can leave the background out. In medical
+**Eleven losses for segmentation** (IoU, Dice, cross-entropy, CCE-Dice, Focal, Tversky,
+Focal-Tversky, Combo, Lovász, Boundary and generalized Dice) and **five metrics** (Dice, IoU,
+Tversky, clDice and surface Dice), each of which can leave the background out. In medical
 images the background is usually most of the picture, and averaging it in turns a model
-that found nothing into one that looks respectable.
+that found nothing into one that looks respectable. `available_losses()` and
+`available_metrics()` take a task, and instance work has fourteen losses rather than eleven.
+
+**One label for a whole image.** `classification_data()` and `classifier()` are the fourth
+task, since the engine's `0.8.0a49`: the label is the directory an image sits in, or a column
+in a CSV. There is no architecture to choose - the network is a contracting path with a dense
+layer on top, and `encoder` decides whose path it is - and the default metric is
+`metric_auc()` rather than accuracy, because a classifier that answers "no finding" where 3%
+have one scores 0.97 and has learnt nothing. `class_balance()` says what the labels look like
+before you train on them, and the split is stratified, because a random 70/15/15 of 100
+images at 3% prevalence leaves some part with none of the rare class 91% of the time.
+
+**A label that is a set**, for one image with several findings at once. `labels_from` names
+one CSV column per class, in class order, and it is a third labelling rather than a switch:
+the target changes and not only the activation, so there is nothing a `multilabel = TRUE`
+could have meant on a `label` column that structurally cannot say an image has two findings.
+`metric_accuracy()` is refused there outright - on 4000 images with findings at 10%, 5%, 3%
+and 2%, a model answering no to everything scores 0.8137 on exact match, above a model
+holding half the signal.
 
 **Tiling that goes both ways** — cut a large image into a grid instead of shrinking it, and
 get a full-size mask back.
@@ -318,7 +363,7 @@ narrow, and three public datasets are three public datasets.
 
 ## Learning it
 
-Three vignettes, all precomputed from real runs — every number and figure in them came out of
+The vignettes are all precomputed from real runs — every number and figure in them came out of
 running the code shown.
 
 **Read them at [maju116.github.io/rplatypus](https://maju116.github.io/rplatypus/)**, which also
@@ -329,16 +374,46 @@ no renderer for `.Rmd` and serves the source, figures and all, as plain text. Fr
 `vignette("data-science-bowl")` is two-dimensional microscopy: the 2018 Data Science Bowl, one
 mask per nucleus, from a folder of images to a figure.
 
+`vignette("instances")` is the same microscopy read a different way: the per-nucleus masks
+kept as identities rather than united, so the answer is a count instead of an area. It opens
+with published weights decoded two ways — one forward pass giving 245 objects or 180 on the same
+picture, which is sixty-five touching nuclei run together — and ends on the measurement that
+closed this direction: connected components caps any model here at 0.7655, so the headroom is in the
+mask and not in the separation signal.
+
 `vignette("blood-cells")` is detection: BCCD, boxes rather than masks, opening with a
 published detector before any training. It ends on the finding that made the measurement
 honest — across five seeds the overlap of the matched boxes varies six times less than the
 average precision does, so on a dataset that size a point of mAP is not a result.
+
+`vignette("classification")` is the fourth task and it continues the detection page: it
+cuts that published detector's boxes out with `detection_crops()`, writes them to disk as one
+directory per class, and trains a classifier on the pieces. It is the only vignette here whose
+subject fails. The classifier learns the three cell types nearly perfectly and cannot do the
+one thing it was added for - reject the boxes that match no annotation - and the measurement
+says why: those crops are red cells that BCCD does not annotate, so the label is a statement
+about the annotation rather than about the picture, and no model can read it off a picture of
+a cell.
 
 `vignette("volumes")` is CT, and generates its own synthetic data so it can be run without
 downloading anything: voxel spacing, splitting by patient, resampling, per-patient scores, a
 slice to look at, and the size of a finding in millilitres. It ends on something worth knowing —
 a model at Dice 0.88 whose volumes were 12% to 23% too large, which is not a contradiction and
 is the reason to report both.
+
+`vignette("fetal-head")` is the only one that does not end on a score. HC18 is 2D obstetric
+ultrasound with a sonographer's ellipse drawn round each fetal skull, and the answer it is
+built to give is a **head circumference in millimetres**, because that is what gets written
+down and charted. Nobody charts a Dice — and the page measures why that matters: tens of the
+test images scoring 0.95 or better are still wrong by more than 2 mm, and the two orderings
+rank the same images differently every time it is run. No figure from that comparison is
+quoted here, because it is the one number on that page that moves between runs; the page
+carries four of them side by side and says so.
+
+What does not move is what the dataset costs before any model does. HC18's annotation is a
+drawn curve 2.52 pixels wide and the mask is that curve filled, so every mask is half a line
+width too large: `pi * w * pixel` predicts +1.11 mm against the +1.12 mm measured, with 0.01
+mm left unexplained. The split is seeded, so that control reads the same on every run.
 
 `vignette("retinal-vessels")` is the one that cannot resize its images: FIVES fundus
 photographs at 2048 x 2048, where the vessel to find is about nine pixels wide and a resize to
@@ -350,8 +425,8 @@ group whose photographs are worst, and the dataset's own quality grading says so
 
 ## What is not in it yet
 
-Ensembling. Classification. Boxes in three dimensions - `yolo3()` is 2D and says so rather
-than accepting a third number and ignoring it.
+Ensembling. Boxes in three dimensions - `yolo3()` is 2D and says so rather than accepting a
+third number and ignoring it.
 
 Augmentation in 3D works, but unevenly, because albumentations supports volumes for most of
 its transforms and not all of them. Every transform in a 3D specification is probed while the
@@ -362,9 +437,16 @@ Resampling volumes to isotropic spacing is deliberate rather than automatic: `vo
 reads and reports the spacing, and `target_spacing` applies it, but applying it changes the
 voxel grid the model sees, which is a decision to take rather than a default to inherit.
 
-The package is **not on CRAN**, and not submitted yet. The name also collides,
-case-insensitively, with an unrelated immunology package archived there in February 2026,
-which is a question to settle before a submission rather than after.
+**The package is on CRAN**: `0.2.1`, published 2026-11-04, after `0.2.0` was submitted on
+2026-10-14 and sent back for two documentation points. Its
+[page on CRAN](https://CRAN.R-project.org/package=rplatypus) is the live answer rather than
+this sentence, which can only say what was true when it was written - and the check page
+beside it is the one that matters, since CRAN runs the checks daily on more platforms than
+any CI matrix here.
+The name question that used to stand here is settled, and the answer is the name at the top
+of this page: `Platypus`, unrelated work in immunology, was archived from CRAN in February
+2026, archiving does not release a name, and this package was renamed rather than asking for
+an exception.
 
 ## About the engine
 
@@ -373,7 +455,7 @@ Python on the machine. This matters because the R keras and tensorflow packages 
 shared one installation with everything else, and an unrelated change could break an R
 session. Nothing here touches a Python anyone else uses.
 
-Three things worth knowing.
+Four things worth knowing.
 
 **The first call downloads about 5 GB**, most of it CUDA libraries that PyTorch ships by
 default whether or not there is a GPU. It is cached afterwards, and everything works
@@ -391,18 +473,39 @@ PyTorch 2.8 onwards ships CUDA 13 builds, and CUDA 13 dropped that whole generat
 cards. Without this, everything runs on the processor instead — perhaps ten times slower,
 with nothing obviously wrong. `platypus_device()` will tell you which is happening.
 
+**On macOS this needs Apple Silicon.** torch has published no macOS x86_64 wheel since
+2.2.2, which was March 2024, and the engine asks for at least 2.7 - so on an Intel Mac
+there is no PyTorch it will accept and the environment cannot be built. Nothing goes
+wrong until it is needed: the package installs from CRAN like any other, loads, and the
+first call that wants the engine is where it stops. This is not something either package
+can work around, and the engine's own README carries the measurement and why its floor
+stays where it is.
+
 **If the engine will not start and the error says there is no such version of
-pyplatypus**, the version does exist and uv is answering from a cached copy of the package
-index — likely because the engine was published minutes ago. Clear the index cache:
+pyplatypus**, the version does exist and something is answering from a cached copy of the
+package index — likely because the engine was published minutes ago. Remove this one
+package's index entry, from both of the places it can live:
 
 ```bash
-rm -rf "$(uv cache dir)"/simple-v*
+rm -rf ~/.cache/uv/simple-v*/pypi/pyplatypus.rkyv \
+       ~/.cache/R/reticulate/uv/cache/simple-v*/pypi/pyplatypus.rkyv
 ```
 
-Only the index: that directory is tens of megabytes, while the wheels beside it are tens of
-gigabytes and include PyTorch. `uv cache clean pyplatypus` is *not* enough — it removes that
-package's built artifacts and leaves behind the index response saying the version does not
-exist.
+**Two places, because there may be two caches, and this page named only one until
+2026-11-09.** reticulate uses a `uv` from your `PATH` if you have one and otherwise
+installs and manages its own — which is the ordinary case for the reader this page is
+written for, the one who never chooses an interpreter. A managed `uv` keeps its cache under
+`~/.cache/R/reticulate/uv/cache`, so `uv cache clean pyplatypus` in a terminal either fails
+with *command not found* or cleans a cache your failing install never read. The command
+above needs no `uv` on your `PATH` and touches one file per cache.
+
+If you do have `uv` and want the shorter form, `uv cache clean pyplatypus` is enough for
+*that* `uv`'s cache — measured on six engine releases — and nothing for the other one.
+
+**And neither command fixes the other cause.** A freshly published version can be missing
+from the package index your machine happens to reach, with every cache empty; then there is
+nothing to clear and waiting a few minutes is the whole remedy. That is why a refusal is
+worth reading twice before anybody deletes anything.
 
 ## About the author
 
@@ -412,6 +515,7 @@ Both halves of this are by **Michał Maj** — this R package, and the Python en
 
 - [LinkedIn](https://www.linkedin.com/in/michal-maj116/)
 - [GitHub](https://github.com/maju116)
+- [Blog — Data Science Guts](https://datascienceguts.com/)
 
 The first version was a Keras and TensorFlow package in 2020, and it is still on `master`
 with the stars and the open issues it earned. Everything here was written from scratch in

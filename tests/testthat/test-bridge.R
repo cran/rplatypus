@@ -33,13 +33,29 @@ test_that("platypus_use_torch replaces the requirement instead of adding a secon
   skip_if_not_installed("callr")
   source_tree <- normalizePath(testthat::test_path("..", ".."), mustWork = FALSE)
   loaded_from_source <- file.exists(file.path(source_tree, "DESCRIPTION"))
+  # **The needle is how the requirement NAMES the engine, which is route-dependent.** The
+  # published route asks for `pyplatypus[extras]==version`; the development route asks for
+  # `normalizePath(PLATYPUS_ENGINE_PATH)[extras]`, and that string contains the word
+  # "pyplatypus" only when the tree happens to be called that. §7 carries two development
+  # commands and they differ in exactly that: `PLATYPUS_ENGINE_PATH="$PWD/../pyplatypus"`
+  # matches, and the `git archive` one, which extracts into `mktemp -d`, does not - so this
+  # test used to fail by construction under the second, with `asked` of length 0 and four
+  # failures that read like a broken pin. Measured 2026-11-05: the same tree copied to a
+  # path containing the word passed, and the only thing that changed was the directory's
+  # name. The two-mode branch below was written for this and fixed one of the two commands.
+  engine_path <- Sys.getenv("PLATYPUS_ENGINE_PATH", unset = "")
+  needle <- if (nzchar(engine_path)) {
+    normalizePath(engine_path, mustWork = TRUE)
+  } else {
+    "pyplatypus"
+  }
   asked <- callr::r(
-    function(source_tree, loaded_from_source) {
+    function(source_tree, loaded_from_source, needle) {
       if (loaded_from_source) pkgload::load_all(source_tree, quiet = TRUE) else library(rplatypus)
       platypus_use_torch("pascal")
-      grep("pyplatypus", reticulate::py_require()$packages, fixed = TRUE, value = TRUE)
+      grep(needle, reticulate::py_require()$packages, fixed = TRUE, value = TRUE)
     },
-    args = list(source_tree, loaded_from_source)
+    args = list(source_tree, loaded_from_source, needle)
   )
   expect_length(asked, 1)
   expect_match(asked, "pascal", fixed = TRUE)
@@ -49,7 +65,7 @@ test_that("platypus_use_torch replaces the requirement instead of adding a secon
   # command - the one where the two halves meet before a release - fail by construction,
   # on a line that reads like a wrong pin. The control that found it: the same failure
   # appears with the previous pin, so it was never about which version the pin names.
-  if (nzchar(Sys.getenv("PLATYPUS_ENGINE_PATH"))) {
+  if (nzchar(engine_path)) {
     tree <- sub("\\[.*$", "", asked)
     expect_true(dir.exists(tree))
     expect_true(file.exists(file.path(tree, "pyproject.toml")))
@@ -183,6 +199,47 @@ test_that("the device report says where the work will happen", {
   expect_s3_class(device, "platypus_device")
   expect_true(nzchar(device$torch))
   expect_type(device$cuda_available, "logical")
+  # Since the engine's 0.8.0a38 the report also names which accelerator answered, or NULL
+  # for the processor. R prints it only when it is not CUDA, but it has to arrive either
+  # way or the printing has nothing to decide on.
+  expect_true(is.null(device$backend) || is.character(device$backend))
+})
+
+test_that("the report is the engine's, not this package's", {
+  # It used to be computed in `inst/python/platypus_shim.py`, which meant a Python user
+  # could not reach any of it. The shim forwards now, so the two cannot drift - and the
+  # cheapest way to see that is that the engine answers the same thing directly.
+  skip_if_no_engine()
+  theirs <- rplatypus:::engine()$device_report()
+  ours <- platypus_device()
+
+  expect_identical(ours$torch, theirs$torch)
+  expect_identical(ours$device, theirs$device)
+})
+
+test_that("a backend that is not CUDA is named, and CUDA is not", {
+  # The printing rule, tested without a machine of either kind: every published set of
+  # weights was trained on CUDA, so that is the unremarkable case, and an `mps` run is the
+  # one worth saying out loud because its numbers are not directly comparable.
+  # `cuda_build = "none"` since engine `0.8.0a85`, and the old literal here is why this
+  # fixture is worth a comment: it said `"cpu-only build"` beside `backend = "mps"`, which
+  # is a machine that cannot exist - a macOS wheel has no CUDA and a working `mps` backend
+  # at once, so the engine was calling the build CPU-only on a machine about to train on
+  # its GPU. Nothing in either suite compared the two, so the impossible pair sat here as
+  # expected output while `print()` stayed indifferent to the value. `pyplatypus#468`.
+  mps <- structure(
+    list(torch = "2.15.0", cuda_build = "none", device = "mps", backend = "mps"),
+    class = "platypus_device"
+  )
+  cuda <- structure(
+    list(torch = "2.7.1", cuda_build = "12.6", device = "A card", backend = "cuda"),
+    class = "platypus_device"
+  )
+
+  expect_output(print(mps), "backend    : mps")
+  expect_output(print(mps), "not directly")
+  expect_silent(expect_output(print(cuda), "device     : A card"))
+  expect_false(any(grepl("backend", capture.output(print(cuda)))))
 })
 
 test_that("a stale uv index cache is explained, because it sounds permanent", {
@@ -242,4 +299,151 @@ test_that("the always-on extras are asked for whatever else is", {
     for (extra in always) expect_match(pascal, extra, fixed = TRUE)
     expect_match(pascal, paste0("==", rplatypus:::pyplatypus_version), fixed = TRUE)
   })
+})
+
+# --- the two things a session has to settle before anything starts Python --------------
+
+test_that("the torch build can be chosen once, by option or by variable", {
+  # `py_require()` is session state, so `platypus_use_torch()` does not survive a restart -
+  # and on a card older than Turing, forgetting it costs about ten times the training time
+  # without costing an error. None of this touches Python.
+  withr::with_options(list(rplatypus.torch = "pascal"), {
+    expect_identical(rplatypus:::torch_build_requested(), "pascal")
+  })
+  withr::with_envvar(c(PLATYPUS_TORCH = "pascal"), {
+    expect_identical(rplatypus:::torch_build_requested(), "pascal")
+  })
+})
+
+test_that("the option wins over the variable, and \"default\" means ask for nothing", {
+  withr::with_envvar(c(PLATYPUS_TORCH = "pascal"), {
+    withr::with_options(list(rplatypus.torch = "default"), {
+      # A session may override what a machine was configured with, not the other way round.
+      expect_null(rplatypus:::torch_build_requested())
+    })
+  })
+})
+
+test_that("a build nobody has heard of is reported and ignored", {
+  # A bad line in ~/.Rprofile must not make the package unloadable.
+  withr::with_options(list(rplatypus.torch = "turing"), {
+    expect_message(result <- rplatypus:::torch_build_requested(), "ignoring a torch build")
+    expect_null(result)
+  })
+})
+
+test_that("an engine that is not the pinned one says so, naming both versions", {
+  # The pin is the mechanism, and on the RETICULATE_PYTHON route it is not in force. The
+  # failure without this is a validator refusing a configuration field by name, which
+  # tells a reader nothing about their interpreter.
+  #
+  # **The envvar is unset rather than skipped, because this claim is about the ordinary
+  # route and is true whatever the suite was invoked with.** The test below proves the
+  # development route is exempt by SETTING the variable; these two asserted a warning
+  # while inheriting whatever the session had, so under either of §7's development
+  # commands they failed - the exemption working, read as the warning missing. Unsetting
+  # keeps the test asking its own question; skipping would have hidden it on exactly the
+  # run where the two halves meet.
+  withr::local_envvar(c(PLATYPUS_ENGINE_PATH = NA))
+  env <- rplatypus:::.platypus
+  old <- env$engine
+  withr::defer(env$engine <- old)
+
+  env$engine <- list(`__version__` = "0.8.0a20")
+  expect_warning(rplatypus:::check_engine_version(), rplatypus:::pyplatypus_version)
+  expect_warning(rplatypus:::check_engine_version(), "0.8.0a20")
+
+  env$engine <- list(`__version__` = rplatypus:::pyplatypus_version)
+  expect_silent(rplatypus:::check_engine_version())
+})
+
+test_that("the development route is exempt, because it asks for a tree with no version", {
+  env <- rplatypus:::.platypus
+  old <- env$engine
+  withr::defer(env$engine <- old)
+  env$engine <- list(`__version__` = "0.8.0a20")
+
+  withr::with_envvar(c(PLATYPUS_ENGINE_PATH = "/tmp"), {
+    expect_silent(rplatypus:::check_engine_version())
+  })
+})
+
+test_that("the version check sits on the route every engine call takes", {
+  # `rplatypus#272`. `#214`'s warning was attached to the delayed import's `on_load` hook,
+  # which fires when something touches the R object `engine()` returns - and `engine()` is
+  # called once in this package, inside `platypus_status()`, against 44 calls of `shim()`.
+  # So a session that never asked for the status compared nothing, and the warning
+  # described a route nobody takes.
+  #
+  # Read off the body rather than by counting calls, because this half must hold with no
+  # Python on the machine, which is how CRAN sees the package. It fails if the call is
+  # removed, which is the whole of what it claims.
+  body_text <- paste(deparse(body(rplatypus:::shim)), collapse = " ")
+  expect_match(body_text, "check_engine_version_once()", fixed = TRUE)
+  # The control: the hook is still there too, so a session that only calls
+  # `platypus_status()` keeps paying it.
+  load_text <- paste(deparse(body(rplatypus:::.onLoad)), collapse = " ")
+  expect_match(load_text, "check_engine_version_once()", fixed = TRUE)
+})
+
+test_that("the version is compared once per session rather than on every engine call", {
+  # The same reason as the test three above: the claim is about the ordinary route, so the
+  # development route's exemption is unset rather than skipped around.
+  withr::local_envvar(c(PLATYPUS_ENGINE_PATH = NA))
+  # Every one of those 44 calls goes through `shim()`, so the comparison has to be cheap
+  # and quiet after the first. The flag is also what stops the check re-entering itself:
+  # reading the engine's version touches the delayed import, whose hook calls it again.
+  env <- rplatypus:::.platypus
+  old_engine <- env$engine
+  old_flag <- env$version_checked
+  # **`withr::defer` rather than `on.exit`, and the difference is not style.** `on.exit`
+  # without `add = TRUE` REPLACES every handler already registered on this frame - and
+  # `local_envvar` above registers its restore there. Measured 2026-11-05: with `on.exit`
+  # here, `PLATYPUS_ENGINE_PATH` was never put back, so the test four below - which skips
+  # when that variable is set - ran instead of skipping, on a route it was written to stay
+  # out of. Two tests passed for the wrong reason and the suite's skip count, which §3D.7
+  # reads as the signal, said 0 because a cleanup had been silently discarded.
+  withr::defer({
+    env$engine <- old_engine
+    env$version_checked <- old_flag
+  })
+
+  # A fake engine, so this needs no Python: what is under test is the comparison and the
+  # flag, and a real engine would answer with the version the pin asks for.
+  env$engine <- list(`__version__` = "0.0.0a0")
+  env$version_checked <- FALSE
+  expect_warning(rplatypus:::check_engine_version_once(), "0.0.0a0", fixed = TRUE)
+  expect_silent(rplatypus:::check_engine_version_once())
+  # And the unwrapped helper still warns every time it is called, which is its own
+  # contract and what `test-bridge.R`'s older test reads both halves of the message from.
+  # Folding the flag into it made that second call silent, which is why the flag is a
+  # wrapper.
+  expect_warning(rplatypus:::check_engine_version(), "0.0.0a0", fixed = TRUE)
+
+  # And the other direction: an engine that agrees with the pin says nothing at all, so
+  # the warning above is not simply unconditional.
+  env$engine <- list(`__version__` = rplatypus:::pyplatypus_version)
+  env$version_checked <- FALSE
+  expect_silent(rplatypus:::check_engine_version_once())
+})
+
+test_that("a foreign engine reached through the shim is reported, not only through status", {
+  skip_if_no_engine()
+  skip_if(nzchar(Sys.getenv("PLATYPUS_ENGINE_PATH")), "that route is exempt by design")
+  # The end-to-end half of the first test: the route itself, with the memo and the flag
+  # reset so that `shim()` does its first-call work again.
+  env <- rplatypus:::.platypus
+  old_shim <- env$shim
+  old_engine <- env$engine
+  old_flag <- env$version_checked
+  on.exit({
+    env$shim <- old_shim
+    env$engine <- old_engine
+    env$version_checked <- old_flag
+  })
+
+  env$shim <- NULL
+  env$engine <- list(`__version__` = "0.0.0a0")
+  env$version_checked <- FALSE
+  expect_warning(rplatypus:::shim(), "0.0.0a0", fixed = TRUE)
 })

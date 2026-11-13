@@ -9,6 +9,8 @@ segmentation_data(
   validation = NULL,
   colormap = NULL,
   labels = NULL,
+  regions = NULL,
+  classes_from = NULL,
   test = NULL,
   split = NULL,
   mode = c("nested_dirs", "config_file"),
@@ -48,6 +50,51 @@ tumour. This is how NIfTI and every other volume format label anything. Give thi
 falls back to the first class, so a list without 0 trains the background as whatever
 that first class is. The engine refuses that combination rather than let it look
 plausible, which means the error arrives before the run and not in the scores.}
+
+\item{regions}{Overlapping classes, named as unions of a label-map value set: a list of
+\code{list(name = , of = )}, where \code{of} holds the voxel values belonging to that region.
+\code{list(list(name = "whole tumour", of = c(1, 2, 4)), list(name = "enhancing", of = 4))}
+is the BraTS shape, and the second entry shows that a single value is ordinary rather
+than an edge case. Give this, \code{colormap} or \code{labels}, not more than one.
+
+\strong{Two things this field changes that its name does not say.} There is \strong{no background
+entry}, so \code{n_class} here is not the same number it would be for that many \code{labels} -
+with \code{labels} the background is a class and with \code{regions} it is not. And each channel
+is an \strong{independent binary question}, a sigmoid per channel rather than one softmax
+across them, so a voxel may be in several regions at once - which is the whole point,
+and the reason \code{save_masks()} cannot write such a prediction as one picture.
+
+Two regions are the minimum: one region is ordinary binary segmentation, which
+\code{labels = c(0, 1)} already says. Disjoint regions are allowed and mean something -
+grouping several values into one class and dropping the background channel - so they
+are not refused.}
+
+\item{classes_from}{For masks kept as \strong{one binary file per class}: one pattern per
+class, in class order. The fourth way of saying what a mask's classes are, and the only
+one that can express an overlap that was drawn independently - a vessel crossing an
+organ, or two annotators' masks of the same structure. Give this, \code{colormap}, \code{labels}
+or \code{regions}, not more than one.
+
+\strong{It is \code{regions}' sibling, not its replacement}, and the difference is the file on
+disk. \code{regions} derives overlapping channels from the values of one label map, which is
+how BraTS stores its ground truth; this reads channels that were separate files to
+begin with, because no single voxel value can hold two things drawn independently.
+Everything the two share is everything after the target: no background entry, a sigmoid
+per channel rather than one softmax across them, a voxel that may be in several classes
+at once, and a prediction \code{save_masks()} cannot write as one picture - use
+\code{\link[=save_class_masks]{save_class_masks()}} or \code{\link[=save_class_volumes]{save_class_volumes()}}.
+
+Patterns are Python regular expressions matched against a sample's \strong{mask} files, with
+the same two rules \code{channels_from} has for images and for the same reason: each must
+match exactly one file, and every mask file must be claimed by some pattern. Both halves
+are refused, because each is invisible from the other side - a pattern matching nothing
+is a class the model is never shown, and a file matching no pattern is a class the data
+has and nobody asked for. R's own quoting applies:
+\code{c("_vessel\\\\.png$", "_organ\\\\.png$")}.
+
+The order is written rather than inferred, and here it matters more than for channels:
+a model trained with the vessel in the first channel and used where the first channel
+is the organ answers plausibly, in range, and nothing further down can notice.}
 
 \item{test}{Optional test data. Only images are read from it.}
 

@@ -15,7 +15,35 @@
 #' and an R package should not break because a Python dependency drifted underneath it.
 #' @keywords internal
 #' @noRd
-pyplatypus_version <- "0.8.0a22"
+pyplatypus_version <- "0.8.0a85"
+
+#' The Python the engine needs, declared rather than left to whatever uv picks
+#'
+#' This is the engine's OWN floor - `requires-python` in `maju116/pyplatypus`'s manifest -
+#' and `tests/testthat/test-python-floor.R` holds the two together, so a floor that moves
+#' there turns this package red until it follows. The pin's ratchet, one field over.
+#'
+#' Until `rplatypus#338` nothing here said anything about the interpreter, and
+#' `py_require()` takes a `python_version` it was never given. Measured on 2026-11-11:
+#' reticulate filters uv's candidate list by these constraints and takes the FIRST that
+#' satisfies them, so the declaration changes the answer in exactly one case - a machine
+#' whose first candidate is below the floor - and that is the case worth fixing. On this
+#' machine the list begins `3.11.11, 3.10.16, 3.12.9, 3.9.21, 3.13.2`, unsorted, and both
+#' with and without the constraint the answer is 3.11.11: a no-op where it does not bite.
+#'
+#' What it buys where it does bite is the SHAPE of the failure. With no constraint, a
+#' machine offering 3.10 first builds an environment uv then cannot resolve, and the user
+#' reads that no version of `pyplatypus==<pin>` matches - on a route where they never chose
+#' a Python at all. With it, reticulate stops first and names the constraint and the versions
+#' it found, in R, before anything is downloaded. Measured both ways: `">=3.14"` and a
+#' `">=3.99"` control each refuse here with that message.
+#'
+#' It is declared ONCE, in `.onLoad`. Asked for rather than assumed, on 2026-11-11: a
+#' constraint survives `py_require(..., action = "remove")` and the add that follows it, so
+#' [platypus_use_torch()] rebuilding the package list does not drop it.
+#' @keywords internal
+#' @noRd
+pyplatypus_python <- ">=3.11"
 
 #' What this session will ask for. Set by [platypus_use_torch()] before the engine starts.
 #' @keywords internal
@@ -140,15 +168,125 @@ engine_start_failure <- function(message) {
   }
 }
 
+#' Which PyTorch build this session should ask for, before anything starts Python
+#'
+#' `py_require()` is session state, so the choice made by [platypus_use_torch()] does not
+#' survive a restart - and on a card older than Turing, forgetting it costs about ten
+#' times the training time without costing an error. This reads the choice from an option
+#' or an environment variable so it can be made once, in `~/.Rprofile` or `~/.Renviron`.
+#'
+#' The option wins over the variable: a session can override what a machine was configured
+#' with, and not the other way round. An unrecognised value is reported and ignored rather
+#' than raising, because a bad line in a startup file must not make the package
+#' unloadable.
+#' @keywords internal
+#' @noRd
+torch_build_requested <- function() {
+  value <- getOption("rplatypus.torch", default = NULL)
+  if (is.null(value)) {
+    value <- Sys.getenv("PLATYPUS_TORCH", unset = "")
+  }
+  if (!is.character(value) || length(value) != 1L || !nzchar(value)) {
+    return(NULL)
+  }
+  if (!value %in% c("pascal", "default")) {
+    packageStartupMessage(
+      "platypus: ignoring a torch build called '", value, "'.\n",
+      "  `rplatypus.torch` and PLATYPUS_TORCH take \"pascal\" - the last build against ",
+      "CUDA 12, for a\n  GTX 10-series card or older - or \"default\"."
+    )
+    return(NULL)
+  }
+  if (identical(value, "default")) NULL else value
+}
+
+#' Say so when the engine that answered is not the one this release was built against
+#'
+#' The pin is the mechanism rather than caution: an R release cannot break because the
+#' engine drifted underneath it. On the one route where that does not hold - a
+#' `RETICULATE_PYTHON` pointing at somebody's own environment - nothing used to compare
+#' the two, so a mismatch arrived as a validator refusing a configuration field by name,
+#' which tells a reader nothing about their interpreter.
+#'
+#' A warning rather than a refusal: the only way to reach this state is to have gone out
+#' of one's way, and refusing would also break somebody deliberately testing an engine
+#' they built. The message names both versions, which is what makes it actionable.
+#'
+#' `PLATYPUS_ENGINE_PATH` is exempt: that route asks for a source tree with no version at
+#' all, and is this package's own documented way of meeting an unpublished engine.
+#'
+#' **Called from `shim()` as well as from the delayed import's `on_load` hook, and the
+#' first of those is the route that matters.** The hook fires when something touches the R
+#' object `engine()` returns, and `engine()` is called once in this package - inside
+#' `platypus_status()` - against 44 calls of `shim()`, whose own `import pyplatypus` never
+#' touches that object. So for as long as the hook was the only site, a session that never
+#' asked for the status compared nothing at all, and this warning described a route nobody
+#' takes. `rplatypus#272`. Once per session, by a flag on the package environment.
+#' @keywords internal
+#' @noRd
+check_engine_version <- function() {
+  if (nzchar(Sys.getenv("PLATYPUS_ENGINE_PATH", unset = ""))) {
+    return(invisible(NULL))
+  }
+  theirs <- tryCatch(.platypus$engine[["__version__"]], error = function(e) NULL)
+  if (is.null(theirs) || identical(theirs, pyplatypus_version)) {
+    return(invisible(NULL))
+  }
+  warning(
+    "platypus: this package pins pyplatypus ", pyplatypus_version,
+    " and the engine that answered is ", theirs, ".\n",
+    "  The pin is what keeps an R release from breaking when the engine moves, and it is ",
+    "not in force here.\n  A configuration this package sends may be refused by name, or ",
+    "quietly mean something else.\n  RETICULATE_PYTHON is the usual cause; unset it to let ",
+    "platypus manage the environment itself.",
+    call. = FALSE
+  )
+  invisible(NULL)
+}
+
+#' The same comparison, at most once in a session
+#'
+#' Both call sites want it once: `shim()` is on the path of all 44 engine calls and
+#' `.onLoad`'s hook fires on the first touch of the delayed import. The flag is set
+#' **before** the comparison runs rather than after, because reading the engine's version
+#' touches that delayed import, whose hook calls this again - so the flag is re-entry
+#' protection first and an optimisation second.
+#'
+#' Separate from `check_engine_version()` on purpose: that function's contract is "compare
+#' and warn", a test calls it twice to read both halves of the message, and folding a
+#' once-per-session flag into it made the second call silent. A guard belongs at the site
+#' that needs guarding.
+#' @keywords internal
+#' @noRd
+check_engine_version_once <- function() {
+  if (isTRUE(.platypus$version_checked)) {
+    return(invisible(NULL))
+  }
+  .platypus$version_checked <- TRUE
+  check_engine_version()
+}
+
 .onLoad <- function(libname, pkgname) {
   check_reticulate_python()
-  reticulate::py_require(.platypus_requirement())
+  # Before `py_require()`, because the requirement is built from it and nothing after this
+  # point can change what the environment will be without a restart.
+  requested <- torch_build_requested()
+  if (!is.null(requested)) .platypus_requirement(requested)
+  # `python_version` as well as the packages: without it the interpreter is whatever uv's
+  # candidate list happens to offer first, which on a machine with an old Python is a
+  # resolver failure about the engine's version rather than a readable word about Python.
+  reticulate::py_require(.platypus_requirement(), python_version = pyplatypus_python)
 
   .platypus$engine <- reticulate::import(
     "pyplatypus",
     delay_load = list(
       # Nothing is downloaded until a function actually needs Python, so library(rplatypus)
       # stays instant and works offline.
+      # Fires when something first needs Python, which is the earliest moment the
+      # engine's own version can be asked for.
+      on_load = function() {
+        check_engine_version_once()
+      },
       on_error = function(e) {
         stop(engine_start_failure(conditionMessage(e)), call. = FALSE)
       }
@@ -177,6 +315,14 @@ shim <- function() {
       "platypus_shim",
       path = system.file("python", package = "rplatypus", mustWork = TRUE)
     )
+    # The version comparison runs HERE as well as on the delayed import's own `on_load`
+    # hook, and this is the route that matters. That hook fires only when something touches
+    # the R object `engine()` returns, and `engine()` is called once in this whole package,
+    # inside `platypus_status()`; every other engine call - 44 of them - comes through this
+    # shim, whose own `import pyplatypus` never touches the delayed object. So a session
+    # that never asked for the status never compared anything, which left `rplatypus#214`'s
+    # warning describing a route nobody takes. `rplatypus#272`.
+    check_engine_version_once()
   }
   .platypus$shim
 }
@@ -185,6 +331,30 @@ shim <- function() {
 #'
 #' Reports whether the Python side has been started, and what it is. Calling this does
 #' not start it - use it to check before a long run, or when something is wrong.
+#'
+#' @section Updating this package:
+#'
+#' **Nothing to do.** Each release of this package pins one exact engine version, that
+#' pin is what gets declared when the package loads, and the environment is resolved from
+#' it on first use. Install a newer `rplatypus` and the next session uses the engine it
+#' asks for; the first call after the upgrade fetches the new engine - a few hundred
+#' kilobytes, with PyTorch already cached - and the environment the old version used is
+#' left alone, so going back to it costs nothing either.
+#'
+#' That is the opposite of the arrangement most R packages wrapping Python have, where a
+#' persistent environment is installed once by hand and updating the R package does not
+#' touch it. Here there is no environment anybody maintains: there is a pin, and the
+#' environment always matches it. The cost is that the two cannot be moved separately -
+#' which is the point, since a release that could drift from its engine is the failure
+#' the pin exists to prevent.
+#'
+#' One case is worth knowing: updating **on the day the engine is published**, uv may
+#' still be serving a cached index listing and report that the pinned version does not
+#' exist. It is a stale read rather than a missing release, it mends itself, and the
+#' failure message says so.
+#'
+#' If `RETICULATE_PYTHON` is set, none of this applies - that Python is used whatever the
+#' pin says, and a mismatch is reported as a warning naming both versions.
 #'
 #' @return A list with the engine version, the interpreter in use and where its
 #'   environment lives, or `NULL` fields when Python has not been started yet.
@@ -248,6 +418,26 @@ print.platypus_status <- function(x, ...) {
 #' On anything from Turing - the RTX 20-series onwards - the default is correct and this
 #' is unnecessary.
 #'
+#' @section Saying it once instead of every session:
+#'
+#' `py_require()` is session state, so this does not survive a restart - and forgetting it
+#' costs about ten times the training time without costing an error, which is the kind of
+#' bill that goes unnoticed. Set it where a session starts instead:
+#'
+#' ```r
+#' options(rplatypus.torch = "pascal")   # ~/.Rprofile
+#' ```
+#'
+#' or `PLATYPUS_TORCH=pascal` in `~/.Renviron`, which also reaches runs that never load an
+#' `.Rprofile` - `Rscript`, a scheduler, CI. The option wins over the variable, so a
+#' session can override what a machine was configured with. `"default"` asks for the
+#' ordinary build, which is how to turn the setting off for one session without editing
+#' the file it came from.
+#'
+#' Both are read when the package is loaded, which is the last moment anything can change
+#' what the environment will be. A value neither of them recognises is reported at load
+#' and ignored: a bad line in a startup file should not make the package unloadable.
+#'
 #' @param build `"pascal"` for the last PyTorch built against CUDA 12, or `NULL` for the
 #'   default.
 #' @return The requirement string now in force, invisibly.
@@ -290,6 +480,17 @@ platypus_use_torch <- function(build = c("pascal", "default")) {
 #' Reports the PyTorch build in use and the device it can see. Starts the engine if it is
 #' not running.
 #'
+#' The answer comes from the engine's own `device_report()` since `0.8.0a38` - this
+#' package used to compute it, in a file of Python it ships, where no user of the engine
+#' could reach it. What stays here is the advice: the line telling you to call
+#' [platypus_use_torch()] is about R's session model and would mean nothing to somebody
+#' who installed the engine with pip.
+#'
+#' **An accelerator that is not CUDA is named**, because the published weights were all
+#' trained on CUDA cards and a score from another backend is not directly comparable with
+#' the registry's. Until `0.8.0a38` the engine asked about CUDA alone, so an Apple Silicon
+#' Mac reported `cpu` while a working `mps` backend sat in the same installation.
+#'
 #' @return A list, printed readably.
 #'
 #' @section Why this page shows no output:
@@ -311,6 +512,14 @@ print.platypus_device <- function(x, ...) {
   cat("torch      :", x$torch, "\n")
   cat("cuda build :", x$cuda_build, "\n")
   cat("device     :", x$device, "\n")
+  # Only when it is not CUDA. Every published set of weights was trained on a CUDA card,
+  # so that is the unremarkable case and naming it would be noise in the line above; an
+  # `mps` or `xpu` run is the one worth saying out loud, because a number from it is not
+  # obviously comparable with the registry's.
+  if (!is.null(x$backend) && !identical(x$backend, "cuda")) {
+    cat("backend    :", x$backend, "- not CUDA, so scores are not directly\n")
+    cat("             comparable with the published weights, which were trained on it\n")
+  }
   if (isTRUE(x$gpu_present_but_unusable)) {
     cat("\n  This machine has a GPU that this PyTorch build cannot use, so the work will\n")
     cat("  run on the processor instead - often about ten times slower.\n")

@@ -21,10 +21,18 @@ test_that("detection_data carries the task so nobody has to type it", {
   )
 })
 
-test_that("a segmentation data block has no task attribute and defaults to segmentation", {
+test_that("a segmentation data block names its task, and a bare list names none", {
+  # This test used to assert the opposite - `expect_null(attr(data, "task"))` - because
+  # `task_of()` answered "semantic_segmentation" for anything untagged and this constructor
+  # relied on it. That default is what made a bare `data` list indistinguishable from this
+  # block, which is `#239`: the inference had no evidence, answered semantic anyway, and
+  # then refused a stated task for disagreeing with an answer nobody had given. The
+  # assertion is inverted rather than deleted, because the old one is the record of why.
   data <- segmentation_data("train/", "valid/", colormap = binary_colormap)
-  expect_null(attr(data, "task"))
+  expect_identical(attr(data, "task"), "semantic_segmentation")
   expect_identical(rplatypus:::task_of(data), "semantic_segmentation")
+
+  expect_null(rplatypus:::task_of(list(train = "train/", validation = "valid/")))
 })
 
 test_that("classes must be named, distinct and non-empty", {
@@ -530,12 +538,18 @@ test_that("evaluate_images gives one row per image, and the counts add up", {
   expect_equal(nrow(images), 4L)
   expect_setequal(
     names(images),
-    c("key", "n_truth", "n_predicted", "matched", "missed", "spurious",
+    c("key", "n_truth", "n_predicted", "matched", "missed", "ignored", "spurious",
       "mean_matched_iou")
   )
-  # Per row, the three outcomes are a partition of the counts, not three free numbers.
+  # Per row, the outcomes are a partition of the counts, not free numbers. `ignored` is
+  # the fourth of them, and it is why `spurious` is not simply what was not matched: a
+  # prediction attributed to a `difficult` truth belongs in neither column. It is zero on
+  # this fixture, which marks nothing difficult - so the identity below would also hold
+  # without the term, and the engine's own suite is where that case is covered
+  # (`pyplatypus#364`). Written with the term because the arithmetic is the claim.
   expect_equal(images$missed, images$n_truth - images$matched)
-  expect_equal(images$spurious, images$n_predicted - images$matched)
+  expect_equal(images$spurious, images$n_predicted - images$matched - images$ignored)
+  expect_true(all(images$ignored == 0L))
 
   # And they decompose the per-class table, which is the assertion that stops the two
   # from drifting apart.
@@ -608,8 +622,19 @@ test_that("the task names that were renamed are named back", {
                "renamed to \"semantic_segmentation\"")
   expect_error(rplatypus:::agreed_task(data, models, stated = "detection"),
                "renamed to \"object_detection\"")
-  expect_error(rplatypus:::agreed_task(data, models, stated = "classification"),
+
+  # This read `stated = "classification"` until the pin moved to `0.8.0a49`, and then it
+  # was a refusal that could no longer fire: the example of an unknown task had become a
+  # known one. §4's fixture that stops being able to fail, and the only safe example is a
+  # value nothing could ever name - every plausible one is on a milestone somewhere.
+  expect_error(rplatypus:::agreed_task(data, models, stated = "not_a_task_anybody_has"),
                "must be one of")
+
+  # And the positive half, which is what makes the line above a change rather than a
+  # deletion: `classification` is now known, so it is refused for disagreeing with the
+  # constructors instead of for being a name nobody has heard of.
+  expect_error(rplatypus:::agreed_task(data, models, stated = "classification"),
+               "disagrees")
 })
 
 test_that("detection can divide one folder, which split_dataset cannot do for it", {
@@ -735,4 +760,18 @@ test_that("size brings every crop to one shape, which is what a classifier needs
   expect_true(all(vapply(cut, function(c) identical(dim(c)[1:2], c(24L, 24L)),
                          logical(1))))
   expect_equal(length(unique(lapply(cut, dim))), 1L)   # one shape, so one batch
+})
+
+test_that("`at` is refused for a detection fit rather than ignored", {
+  # Boxes are in the source image's coordinates already, so there is no grid to choose.
+  # An argument silently accepted and dropped is the shape this package keeps refusing.
+  #
+  # No engine: the refusal is R's own and happens before the bridge, so this runs on a
+  # machine with no Python - which is also the only way to be sure it is R's refusal and
+  # not the engine's.
+  fit <- structure(
+    list(task = "object_detection", models = "detector", engine = NULL),
+    class = "platypus_fit"
+  )
+  expect_error(evaluate(fit, at = "source"), "`at` is for segmentation")
 })

@@ -7,6 +7,25 @@ vignette: >
   %\VignetteEncoding{UTF-8}
 ---
 
+<!--
+THIS PROSE HAS A COUNTERPART, AND THIS FILE IS THE SOURCE.
+
+The engine mirrors it as pyplatypus's `retinal-vessels.qmd`. It exists, merged as
+maju116/pyplatypus#248, so this pair is compared on both sides and this vignette is no
+longer listed in `awaiting` in tests/testthat/test-article-pairs.R.
+
+By maju116/rplatypus#117 the vignette is the source and the article is the copy, so an edit
+here is an edit there, and an edit there alone is a mistake nothing will catch. What is held
+by a test is the walk: the `##` headings and their order, asserted from both sides -
+`tests/testthat/test-article-pairs.R` here and `tests/test_articles.py` in the engine. The
+route is deliberately not held, because the engine reaches each destination through a
+configuration file where this package reaches it through constructors.
+
+So: renaming or reordering a `##` heading in this file breaks both suites until the article
+follows. Changing the body of a section breaks neither, and that is the part no test can
+check - a heading test does not stop prose drifting.
+-->
+
 
 
 
@@ -134,7 +153,7 @@ spec <- platypus_spec(
 )
 spec
 #> platypus specification
-#>   data        : /tmp/RtmpkhrXG3/train.csv 
+#>   data        : /tmp/RtmpLgvYTS/train.csv 
 #>   classes     : 2 
 #>   models      : 1 
 #>     vessels        u_net            512x512, tiled 4x4, cce_dice, 15 epochs
@@ -181,11 +200,18 @@ plot(fit)
 
 ``` r
 evaluate(fit)
-#>     model architecture loss_function parameters epochs_run best_epoch
-#> 1 vessels        u_net      cce_dice    1942594         15         15
-#>         loss      dice       iou
-#> 1 0.07751003 0.8345117 0.7548818
+#>     model architecture loss_function parameters  load_shape epochs_run
+#> 1 vessels        u_net      cce_dice    1942594 2048 x 2048         15
+#>   best_epoch       loss foreground      dice       iou dice_worst  iou_worst
+#> 1         NA 0.07707521  0.0701509 0.8725505 0.7859755   0.100926 0.05315983
 ```
+
+`best_epoch` is empty, and it is worth a word because the column is new in the engine's
+`0.8.0a73` and reads as a gap otherwise. It names the epoch whose weights the run **ended
+on**, which only a callback that replaces weights can answer - `callback_early_stopping()`
+with its `restore_best` default, or one of the two averagers. The specification above asks
+for no callbacks at all, so nothing selected an epoch and this run ended on its last:
+`epochs_run` already says which.
 
 That is the whole test set as one row, and it is the least informative view of it. The
 distribution is the finding, and `summary()` gives it - including which case is the worst,
@@ -195,10 +221,10 @@ because the first thing anyone does with a low score is go and look at that imag
 ``` r
 per_case <- evaluate_cases(fit)
 summary(per_case)
-#>   metric   n      mean        sd    median         min       max worst_case
-#> 1   dice 200 0.8693033 0.1216219 0.9002321 0.006706456 0.9563482      122_G
-#> 2    iou 200 0.7836241 0.1415640 0.8185659 0.003380554 0.9163482      122_G
-#> 3 cldice 200 0.8209798 0.1442591 0.8672186 0.009086774 0.9561177      122_G
+#>   metric   n      mean        sd    median        min       max worst_case
+#> 1   dice 200 0.8725505 0.1075551 0.9028940 0.10092598 0.9557962      122_G
+#> 2    iou 200 0.7859755 0.1299171 0.8229785 0.05315983 0.9153351      122_G
+#> 3 cldice 200 0.7892405 0.1445759 0.8286990 0.15440816 0.9353433      122_G
 ```
 
 Now by the disease in the file name. `group_by` pools a group's cases into one score, the way
@@ -209,10 +235,10 @@ a patient's slices would be pooled:
 evaluate_cases(fit, group_by = "_([NADG])$")
 #> platypus scores by group (4 rows)
 #>  group      dice       iou    cldice
-#>      A 0.9129010 0.8397590 0.8665145
-#>      D 0.8882682 0.7989953 0.8136649
-#>      G 0.8889359 0.8000760 0.7560313
-#>      N 0.8910453 0.8035004 0.8477083
+#>      A 0.9129180 0.8397875 0.8297471
+#>      D 0.8900999 0.8019639 0.7770124
+#>      G 0.8916201 0.8044354 0.7302487
+#>      N 0.8843446 0.7926683 0.8199539
 ```
 
 Pooling answers "how good is it on this group". It does not show the spread, and the spread is
@@ -226,16 +252,17 @@ per_case$disease <- diseases[sub(".*_([NADG])$", "\\1", per_case$case)]
 spread <- function(x) c(n = length(x), mean = mean(x), sd = sd(x), worst = min(x))
 round(t(vapply(split(per_case$dice, per_case$disease), spread, numeric(4))), 4)
 #>                       n   mean     sd  worst
-#> AMD                  50 0.9048 0.0585 0.7010
-#> diabetic retinopathy 50 0.8715 0.0823 0.5139
-#> glaucoma             50 0.8135 0.2053 0.0067
-#> normal               50 0.8875 0.0542 0.6622
+#> AMD                  50 0.9065 0.0515 0.7030
+#> diabetic retinopathy 50 0.8753 0.0756 0.6137
+#> glaucoma             50 0.8267 0.1803 0.1009
+#> normal               50 0.8817 0.0520 0.6816
 ```
 
 Compare that table with the pooled one above and the reason for having both becomes concrete.
 Pooled, glaucoma and diabetic retinopathy are within a few thousandths of each other. Per
 case, glaucoma's mean is several points lower and its spread more than twice as wide, with a
-worst case near zero. (No figure is quoted here on purpose: the table is directly above, and a
+worst case far below its own group's mean. (No figure is quoted here on purpose: the table
+is directly above, and a
 number repeated in prose is a number that goes stale the next time this is rebuilt.) Pooling hid it because Dice is a ratio of sums: fifty images' counts
 added together are dominated by the ones with the most vessel to find, and a photograph the
 model failed on contributes little to the numerator *and* little to the denominator.
@@ -260,25 +287,49 @@ round(c(
   sd_of_difference = sd(per_case$cldice - per_case$dice)
 ), 4)
 #>      correlation  mean_difference sd_of_difference 
-#>           0.9316          -0.0483           0.0540
+#>           0.8581          -0.0833           0.0760
 ```
 
 Read those two numbers together, because they say different things. The **correlation** is
 high: the two metrics rank the cases much the same way, so clDice is not finding a different
-set of bad images. The **mean difference** is negative and not small: clDice sits about five
-points *below* Dice, which says the vessels this model draws are less connected than their
+set of bad images. The **mean difference** is negative and not small - clDice sits several
+points *below* Dice - which says the vessels this model draws are less connected than their
 pixel overlap suggests. It is getting the right pixels and breaking the lines.
 
-That gap is a property of the model rather than of the metric, and the engine's own run of the
-same configuration is the evidence: at forty epochs instead of fifteen the two agree to a
-correlation of 0.978 and a mean difference of +0.004. **The better-trained model closes the
-gap.** So a large negative gap here is not clDice being pessimistic - it is clDice measuring
-the thing that fifteen epochs had not finished learning, and Dice not noticing.
+That gap is the metric's **peel count** rather than the model's training, and the way to tell
+is to measure one set of weights two ways. `metric_cldice()` above takes its default
+`iterations = 5`; the engine's article measures the same metric at `iterations: 12`, a number
+it argues for against vessels nine pixels across. Those are two measurements rather than one,
+so reading this page's clDice against the article's says something about the metric before it
+says anything about either model.
+
+The published forty-epoch weights settle how much is which, because they can be re-scored
+without being retrained. On their own test split, at this page's own five peels, they give a
+correlation of 0.856 and a mean difference of -0.082 - this page's own 0.8581 and -0.0833, to
+within 0.002 on both. At twelve peels the same weights give 0.973 and -0.001.
+
+So of the distance between this page's figures and the article's, about 0.085 is the peel
+count and 0.0015 is the forty epochs. **A large negative gap here is a skeleton that was not
+thinned, rather than a model breaking lines.** Twelve peels is chosen so that the widest
+vessels in the set reach a centreline and not only the average one; at five they do not, and
+what is left of them is counted as skeleton - which makes part of this number a measure of
+thickness, the one thing clDice exists to ignore.
+
+**The article's own table was measured before clDice's definition changed, and the two
+re-scores quoted above were not.** `0.8.0a72` made the soft skeleton erode with a
+four-neighbour cross rather than a 3 x 3 square, because that is what the reference
+implementation does; a cross erodes less, leaves a thinner skeleton, and scores lower. How
+much lower depends on the prediction - measured on ten of these masks with the prediction
+thinned, between 0.004 and 0.074, and on the published weights at twelve peels, 0.004 - so a
+clDice from one definition and a clDice from the other are not a difference worth reading.
+Everything this document prints, and both re-scores above, come from the pinned engine. The
+article's forty-epoch table and every clDice figure in the tables below do not.
 
 ## The worst case, drawn
 
-A table says a case scored near zero. A picture says why — and this is the panel that found
-the quality finding above, because the worst glaucoma photograph turns out to be nearly black.
+A table says one case scored far below the rest. A picture says why — and this is the panel
+that found the quality finding above, because the worst glaucoma photograph turns out to be
+nearly black.
 
 Drawing it needs two images out of two hundred, and the whole split at 2048 x 2048 is about
 6.7 GB, so `predict()` is asked for the two by name. It keeps one answer at a time and
@@ -302,9 +353,214 @@ plot_masks(
 ```
 
 <div class="figure">
-<img src="figures/retinal-vessels-worst-1.png" alt="The best and the worst validation case: image, truth and prediction"  />
+<img src="figures/retinal-vessels-worst-1.jpg" alt="The best and the worst validation case: image, truth and prediction"  />
 <p class="caption">plot of chunk worst</p>
 </div>
+
+## Two of those choices, measured afterwards
+
+`loss_cce_dice()` and `splits = c(4, 4)` are the two decisions in the specification above that
+read as taste. Both have since been measured on this dataset - after this vignette was
+written, with the engine, and with every arm kept rather than described - and one of the
+answers contradicts the section this document opens with.
+
+The tables below are **transcriptions**. The runs live in the project's workbench under
+`measurements/fives/`, and each table is printed by a script that reads the stored records
+back: `losses-read.py`, `boundary-read.py` and `tiling-read.py`. Nothing in this document runs
+them, and no number below was produced by the knit you are reading.
+
+**Every arm below was measured between 2026-10-16 and 2026-10-22, which the `clDice - dice`
+column makes matter.** clDice's definition moved in `0.8.0a72`, after all of them had run,
+and the arms' checkpoints were not kept - so that column cannot be re-read under the current
+definition without retraining fifteen models, and it is left as it was measured rather than
+adjusted. Within each table the comparison is sound, because every arm in it was scored the
+same way; it is reading one of these columns against this document's own clDice that is not.
+The Dice columns are unaffected.
+
+**The setting is not this vignette's**, which is the first thing to know before comparing
+anything to the numbers above. Every arm trained on **148 of the 600 training retinas** - every
+second one within each disease group, so the four stay balanced - for up to 40 epochs with
+early stopping on `val_dice` at patience 8, and every arm was scored case by case on the same
+200 test images. So no absolute Dice below is comparable to the one this document printed;
+what the tables are for is the differences, each paired case against case.
+
+A difference is read against a measured **floor** rather than against zero. The baseline ran
+twice with different seeds, and the floor is the larger of that pair's mean difference and that
+mean's own standard error: **0.0009** over all 200 cases and **0.0022** over the 67 that
+FIVES's own quality assessment flags - the grading the section above says nothing in this
+pipeline reads. The `x` columns are multiples of that floor, and a row at 2x says nothing.
+
+### The loss is a decision, and this configuration already had the right one
+
+All eleven of the engine's semantic losses, at that setting:
+
+| loss | dice | clDice - dice | vs `cce_dice` | x | flagged | x | seeds |
+|---|---|---|---|---|---|---|---|
+| `focal` | 0.8673 | +0.0078 | +0.0001 | 0.1 | +0.0020 | 0.9 | 1 |
+| `cce` | 0.8672 | +0.0084 | +0.0000 | 0.0 | -0.0028 | 1.3 | 1 |
+| `cce_dice`, the baseline | 0.8672 | +0.0052 | - | - | - | - | 2 |
+| `combo` | 0.8612 | +0.0048 | -0.0060 | 6.9 | -0.0021 | 1.0 | 1 |
+| `lovasz` | 0.8562 | +0.0041 | -0.0110 | 12.6 | -0.0192 | 8.7 | 2 |
+| `generalized_dice` | 0.8504 | +0.0082 | -0.0167 | 19.2 | -0.0229 | 10.4 | 1 |
+| `boundary`, surface 0.1 | 0.8491 | +0.0045 | -0.0181 | 20.8 | -0.0329 | 15.0 | 1 |
+| `iou` | 0.8309 | +0.0098 | -0.0362 | 41.5 | -0.0482 | 21.9 | 1 |
+| `boundary`, surface 0.3 | 0.8245 | -0.0051 | -0.0427 | 48.9 | -0.0581 | 26.5 | 2 |
+| `tversky`, alpha 0.7 | 0.8201 | +0.0134 | -0.0471 | 53.9 | -0.0638 | 29.1 | 1 |
+| `dice` | 0.8127 | +0.0154 | -0.0545 | 62.3 | -0.0648 | 29.5 | 1 |
+| `focal_tversky`, 0.7 and 1.33 | 0.7913 | +0.0188 | -0.0759 | 86.9 | -0.0940 | 42.8 | 1 |
+
+**The menu spans 0.0760 of Dice**, 87 times the floor and 25 times the 0.0030 that separated
+the four architectures measured on nuclei. So the loss is a decision where the architecture
+was a menu - which is worth knowing before spending an afternoon choosing between `u_net()`
+and `linknet()`.
+
+**And nothing in the menu beats the default.** `focal` at +0.0001 and `cce` at +0.0000 tie
+`cce_dice`, both below every floor measured anywhere here, and nine rows are worse. The family
+designed for thin structures under class imbalance - Tversky, Focal-Tversky, Lovasz - holds
+four of the five worst rows. `loss_cce_dice()` has been this example's objective since it was
+written and nobody had measured whether that was right.
+
+Two cautions the table carries about itself:
+
+**Nine of eleven rows have one seed.** The four at the top move by less than the seed floors
+measured on any non-baseline loss here - 0.0120 for `boundary` at surface 0.3, 0.0465 for
+`lovasz` - so one seed cannot distinguish them from the baseline. Everything from `boundary`
+at surface 0.1 downwards is 10x to 87x the floor, and a second seed will not move it.
+`lovasz` is the warning worth reading twice: one of its seeds scores 0.8706, the highest
+single number in this table, and the other scores 0.8418.
+
+**The stopping rule is a confound, and it was priced rather than argued.** Four arms stopped
+early enough that part of their deficit is convergence - `focal_tversky` at 20 epochs,
+`lovasz`'s second seed at 21, `dice` at 25, `iou` at 26 - while all three `boundary` arms ran
+into the 40-epoch cap. Re-read at 20 epochs, the budget every arm was granted, **the ordering
+does not change.**
+
+The `clDice - dice` column also goes somewhere, and it was nobody's question: it grows as the
+loss gets worse, from +0.0052 at the baseline through +0.0098 for `iou` and +0.0154 for `dice`
+to +0.0188 for `focal_tversky`. A worse objective loses more Dice than clDice, so what
+degrades first is the vessel's bulk and its connectedness survives longer. There is exactly
+one exception, and it is the next table's subject.
+
+### A surface loss is the one that breaks the lines, and it gets worse with the dose
+
+`loss_boundary()` is the obvious thing to reach for on a nine-pixel structure: the boundary
+*is* the object, so an objective weighing the surface should be the one that helps. It does the
+opposite here, and it does so by a dose. `alpha` weights the **region** term, so the surface
+term's share is `1 - alpha`:
+
+| surface share | seeds | flagged dice vs baseline | x | clDice - dice | its own pair, flagged |
+|---|---|---|---|---|---|
+| none, the baseline | 2 | - | - | +0.0052 | 0.0012 |
+| 0.1, `alpha = 0.9` | 1 | -0.0329 | 15.0 | +0.0045 | unmeasured |
+| 0.3, `alpha = 0.7` | 2 | -0.0581 | 26.5 | -0.0051 | 0.0120 |
+
+**Three times the surface term costs 1.77 times the Dice and 4.18 times the gap**, and the gap
+changes sign: at surface 0.3 clDice falls below Dice, which no baseline run does. So the
+argument for this loss was backwards - connectedness is what it costs first, and on the
+flagged photographs it costs 15 to 27 times the noise.
+
+Two things keep that honest. **The dose has its own noise and it is ten times the
+baseline's**, which is the last column: the two arms at surface 0.3 sit 0.0120 apart on the
+flagged cases where the baseline's two sit 0.0012 apart. (That column is each pair's own mean
+difference; the `x` column's denominator is still the baseline's 0.0022 from above, so the two
+are not the same quantity and the table would mislead if they were read as one.) That is this loss's documented behaviour - it grows noisier the more of the
+objective the surface term owns - reproduced on real data, and it is also the denominator the
+dose claim has to clear. Judged against it the two doses are 2.1x apart, not the twentyfold the
+baseline's floor would suggest. And **both arms at the higher dose stopped on the epoch cap
+with their best at the last epoch**, so part of their deficit is being undertrained rather than
+being worse.
+
+### Tiling against resizing, where this document's first section is too strong
+
+Same data, same model, same loss. One arm tiles 2048 into 4 x 4 as the configuration above
+does; two resize the whole retina to 512 and keep `splits` unset. All three are scored on the
+**source grid**, 2048 x 2048, which for the resized arms means a second scoring pass.
+
+| arm | dice | vs tiled | x | clean, 133 | flagged, 67 | clDice - dice | training |
+|---|---|---|---|---|---|---|---|
+| tiled, 4 x 4 at 2048 | 0.8672 | - | - | 0.9079 | 0.7865 | +0.0052 | 418 min |
+| resized to 512, same cap | 0.8667 | -0.0005 | 0.6 | 0.8935 | 0.8134 | +0.0138 | 26 min |
+| resized to 512, matched steps | 0.8705 | +0.0033 | 3.8 | 0.8984 | 0.8152 | +0.0141 | 165 min |
+
+There are two resized arms because sixteen tiles make "the same number of epochs" the wrong
+comparison: 148 retinas at `batch_size = 4` are 37 gradient steps an epoch resized and 592
+tiled. The first resized arm is the comparison somebody would actually run - the same 40-epoch
+cap and the same patience. The second was granted the tiled arm's 23,680 steps and **did not
+spend them**, stopping on patience at 41% of the budget, so that row is converged against
+converged. The truncation the first arm suffered is worth +0.0038, which is worth knowing
+before budgeting for the matched arm: a measurement that cannot afford it loses 0.004 and the
+ability to say so.
+
+**The overall column says the two methods are equivalent, and it is hiding the largest effect
+in the measurement.** Resizing is better by 0.027 to 0.029 on the 67 flagged photographs and
+worse by 0.010 to 0.014 on the 133 clean ones, both many times their own floors - 0.0019 to
+0.0025 flagged, 0.0007 to 0.0013 clean. The two are good at different pictures, and a swing of
+about 0.03 in each direction averages out to 0.0033.
+
+So what survives from "Why a vessel cannot be resized" is the narrow claim: on a clean
+photograph resizing costs Dice, and `splits` is what lets an image too large to resize be
+trained at all. What does not survive is the stronger reading - that resizing a 2048 retina
+destroys the thin vessels - because on the hard pictures the vessels it was supposed to have
+destroyed are found *more* reliably from a whole blurred eye than from a sixteenth of one. A
+mechanism suggests itself and is recorded as a hypothesis rather than a finding: a 512 tile
+sees one sixteenth of a retina and has no global context to tell a vessel from an artefact,
+where a resized image always shows the whole eye. Separating that would need overlapping tiles
+or a resized arm at 1024, and neither was run.
+
+What tiling costs is also not what the table makes it look like. Per gradient step the three
+arms are identical to within the noise of six readings, 0.502 to 0.554 s, so tiling is sixteen
+times the work rather than sixteen times the overhead, and the whole factor shows up in the
+epoch rather than anywhere surprising.
+
+### The rig, which is worth more than the ranking
+
+This is the part to carry away from all three tables, and it is about measuring rather than
+about retinas.
+
+`evaluate_cases()` builds its dataset from the model's own specification, so it scores each
+model at that model's own `load_shape`. Put a tiled model beside a resized one and the first
+is scored on 2048 while the second is scored on 512, against a truth reduced the same way.
+Nobody passes a flag for this and nothing warns:
+
+| arm | honest, both on 2048 | as the default comparison reports it | the rig |
+|---|---|---|---|
+| resized to 512, same cap | -0.0005 | +0.0056 | +0.0062 |
+| resized to 512, matched steps | +0.0033 | +0.0187 | +0.0154 |
+
+The reported figure is **5.7 times** the honest one and the rig alone is **4.7 times** the
+effect. A table built that way would have concluded that resizing beats native-resolution
+tiling by a wide margin, and every number in it would have been a real Dice of a real
+prediction against a real mask - just not the mask the other arm was judged against.
+
+**And the bias has the opposite sign on clDice:** +0.0096 to +0.0156 on Dice against -0.0156
+to -0.0230 on clDice. Upsampling a 512 prediction to 2048 smooths it, and a smoothed vessel
+agrees better with a skeleton and worse with a boundary. So the rigged comparison flatters
+resizing on Dice and penalises it on clDice, and a comparison reporting only one of the two is
+wrong in a direction set by which one it picked.
+
+**There is an option for this since `0.8.0a32`, and there was none when this was measured.**
+The arms above were rescored onto one grid by a function written for that measurement, which
+lived in the workbench and not in the package - so the honest comparison was available only to
+somebody who had already noticed the problem, which is what `maju116/rplatypus#187` was filed
+about. `evaluate(at="source")` is that function now: every prediction goes back onto the grid
+of the file it came from and is scored against the truth as stored, and the `load_shape` column
+reads `source` so a table says which grid produced it.
+
+The grid is the files' own rather than one you name, and that is the point rather than a
+limitation: a named grid resamples the **truth**, so the thing both models are judged against
+would itself be an interpolation somebody chose. Here only predictions move.
+
+The rule the numbers above teach is unchanged and is now enforceable rather than advisory:
+**compare two models only where their predictions and the truth are on the same grid**, and say
+which grid that is.
+
+### What none of this says
+
+One dataset, one architecture, one loss, at one reduction of one resolution, with 148 retinas
+rather than 600. The subsets already disagree by about 0.03 in either direction *inside* this
+dataset, which is the strongest available warning against reading any overall column as a
+rule. And the published `fives-unet` weights' own score - measured on the full training set at
+a pinned commit - is not comparable to any row above.
 
 ## Notes
 

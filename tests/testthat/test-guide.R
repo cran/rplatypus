@@ -26,8 +26,10 @@ guide_sections <- c(
   "Several models at once",
   "Dividing one folder",
   "Augmentation, callbacks, and the rest of a model",
+  "Overlapping classes instead of one per voxel",
   "Instances instead of one mask",
   "Detection instead of segmentation",
+  "One label instead of a mask",
   "Not training at all",
   "What is checked, and when",
   "The same run from code"

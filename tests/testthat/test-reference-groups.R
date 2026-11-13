@@ -139,11 +139,17 @@ test_that("the About section is in the agreed order and every entry has a file",
 })
 
 # The reference groups, in the order both sites show them. Each package carries the subset it
-# has: "Setting up" is the reticulate bridge and exists only here, "Looking at the results" is
-# plotting which the engine deliberately does not carry, "Masks and volumes" has no public
-# counterpart there - measured, the engine's `__all__` holds 24 names and not one is a mask,
-# volume or colormap utility - and "Records" and "When something is wrong" are the engine's,
-# because this package has no record reader and documents no condition classes.
+# has: "Setting up" is the reticulate bridge and exists only here, and "Records" and "When
+# something is wrong" are the engine's, because this package has no record reader and
+# documents no condition classes.
+#
+# Two sentences here were true when they were written and are not now, which is why they are
+# replaced rather than kept. "Looking at the results" was described as plotting the engine
+# deliberately does not carry: it has carried it since `0.8.0a1`, and this package mirrors its
+# six drawing decisions rather than restating them. "Masks and volumes" was described as
+# having no public counterpart there, measured against an `__all__` of 24 names with no mask
+# utility among them: `save_class_masks` arrived in `0.8.0a23` and is filed under that title
+# on both sides, which is what the entry in `shared_placement` below holds it to.
 #
 # **Asserting the two lists are equal would assert something false**, which CLAUDE.md did for
 # a while: "the same eight groups" was written down and five of eight titles matched. A shared
@@ -164,7 +170,10 @@ group_order <- c(
   "Records",
   "Looking at the results",
   "Masks and volumes",
-  "When something is wrong"
+  "When something is wrong",
+  # Added 2026-10-22 with `platypus_fact()`. R-only today, like "Setting up" - the shared
+  # order carries a group both sides agree on the *placement* of, not one both sides fill.
+  "The animal"
 )
 
 test_that("the groups are a subsequence of the order pyplatypus shares", {
@@ -204,8 +213,34 @@ shared_placement <- c(
   available_weights = "Weights",
   # Shared from pyplatypus 0.8.0a1, when this package stopped restating the engine's
   # drawing decisions and started mirroring them.
-  drawing_style = "Looking at the results"
+  drawing_style = "Looking at the results",
+  # Shared from pyplatypus 0.8.0a23. The two are not the same call - this one takes an R
+  # array and forwards, that one takes numpy and writes - but they are the same answer to
+  # the same question, and a reader of one site looking for the other's has to find it in
+  # the same group.
+  save_class_masks = "Masks and volumes",
+  # Shared from `#154`. The engine has had both since `0.8.0a19` and this package drew
+  # neither until now, so a reader of one site looking for the other's found nothing rather
+  # than finding it filed elsewhere - which the subsequence test cannot catch.
+  overlay_instances = "Looking at the results",
+  overlay_instance_agreement = "Looking at the results",
+  # Shared from `#103`, which is the release that made a flow field reachable from R at all.
+  flow_to_colours = "Looking at the results"
 )
+
+# `available_separations` and `available_decodings` are deliberately NOT here, and the reason
+# is a property of this side rather than an omission. Eight of the ten listings share one help
+# topic - `available_components` - so what this package files is that topic and the names
+# under it are not entries of their own. Only `available_transforms` and `available_weights`
+# have their own pages, which is why those two are the ones pinned above. Adding a name
+# documented under a shared topic makes this test fail reporting "under nothing here", which
+# is true and not a drift; it was tried on 2026-10-15 when the two arrived. Two other
+# instruments cover them, and a third does not: the first test in this file fails if the
+# `available_components` topic is in no group (measured - removing it gives 2 failures), and
+# `test-available.R` pins the family by name against the namespace, which is what caught
+# these two arriving. `tools/build-reference.R` does **not**: it regenerates happily with a
+# topic missing from the grouping, 64 topics instead of 65 and exit 0, which was written here
+# as a claim about the generator before being measured.
 
 test_that("the shared names are filed where pyplatypus files them", {
   skip_if_not_installed("yaml")
